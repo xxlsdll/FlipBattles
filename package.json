@@ -1,10 +1,10 @@
 {
-  "name": "limiteds-api",
+  "name": "api",
   "version": "1.0.0",
   "description": "Scrapes Rolimon's classic limiteds and serves them as a JSON API for Roblox.",
-  "main": "limiteds_api.js",
+  "main": "api.js",
   "scripts": {
-    "start": "node limiteds_api.js"
+    "start": "node api.js"
   },
   "engines": {
     "node": ">=18"
