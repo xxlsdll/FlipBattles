@@ -1,16 +1,17 @@
 /**
- * api.js  (Node.js)
- * -----------------
- * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON.
- * Optionally protected by an API key set via the API_KEY environment variable
- * (set this in Railway -> your service -> Variables).
+ * limiteds_api.js  (Node.js version)
+ * ----------------------------------
+ * Same behaviour as the Python one: scrape Rolimon's classic limiteds on a
+ * schedule, detect what changed, and serve them as JSON for your Roblox game
+ * (HttpService:GetAsync + JSONDecode).
  *
- * Requires Node.js 18+.
+ * Requires Node.js 18 or newer (uses the built-in fetch).
  *
  * Local run:
  *   npm install
- *   node api.js
- *   (to test auth locally on Windows PowerShell:  $env:API_KEY="test"; node api.js)
+ *   node limiteds_api.js
+ *
+ * Your game fetches:  https://YOUR-APP.up.railway.app/limiteds
  */
 
 const express = require("express");
@@ -27,10 +28,7 @@ const MAX_VALUE = 40_000_000;
 
 const REFRESH_MS = 10 * 60 * 1000;   // re-scrape every 10 minutes
 const CACHE_FILE = "limiteds_cache.json";
-const PORT = process.env.PORT || 8080;
-
-// Set this in Railway -> Variables. If left empty, the API is OPEN (no key).
-const API_KEY = process.env.API_KEY || "";
+const PORT = process.env.PORT || 8080;   // Railway sets PORT; 8080 locally
 
 const HEADERS = {
   "User-Agent":
@@ -46,10 +44,10 @@ const NAME = 0, RAP = 2, VALUE = 3;
 // In-memory state
 // ---------------------------------------------------------------------------
 let state = {
-  items: {},
-  version: 0,
-  hash: null,
-  updatedAt: null,
+  items: {},        // { "1028720": { name, headshot, value }, ... }
+  version: 0,       // bumps every time the data actually changes
+  hash: null,       // fingerprint of the current items
+  updatedAt: null,  // ISO timestamp of the last change
   count: 0,
 };
 
@@ -67,7 +65,7 @@ async function scrape() {
   for (const [itemId, fields] of Object.entries(payload.items)) {
     const value = fields[VALUE];
     const rap = fields[RAP];
-    const effective = value === -1 ? rap : value;
+    const effective = value === -1 ? rap : value;   // -1 => no value set, use RAP
 
     if (effective < MIN_VALUE || effective > MAX_VALUE) continue;
 
@@ -81,7 +79,7 @@ async function scrape() {
     ]);
   }
 
-  items.sort((a, b) => b[1].value - a[1].value);
+  items.sort((a, b) => b[1].value - a[1].value);   // most valuable first
 
   const table = {};
   for (const [id, data] of items) table[String(id)] = data;
@@ -99,7 +97,7 @@ function hashTable(items) {
 
 function applyUpdate(newItems) {
   const newHash = hashTable(newItems);
-  if (newHash === state.hash) return false;
+  if (newHash === state.hash) return false;   // nothing changed
 
   const oldItems = state.items;
   const added = Object.keys(newItems).filter((k) => !(k in oldItems));
@@ -119,11 +117,19 @@ function applyUpdate(newItems) {
     `[update] v${state.version}  total=${state.count}  ` +
     `+${added.length} added  -${removed.length} removed  ~${changed.length} value changes`
   );
+
+  // --- OPTIONAL: push to an API you already run, instead of just serving here ---
+  // fetch("https://your-api.example.com/limiteds", {
+  //   method: "POST",
+  //   headers: { "Content-Type": "application/json", Authorization: "Bearer YOUR_SECRET" },
+  //   body: JSON.stringify({ version: state.version, items: newItems }),
+  // }).catch((e) => console.error("[push error]", e.message));
+
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Disk cache
+// Disk cache (instant serve on restart; fallback if a scrape fails)
 // ---------------------------------------------------------------------------
 function saveCache() {
   try {
@@ -146,7 +152,7 @@ function loadCache() {
     state.updatedAt = new Date().toISOString();
     console.log(`[cache] loaded ${state.count} limiteds from ${CACHE_FILE}`);
   } catch {
-    // no cache yet -- fine
+    // no cache file yet -- that's fine
   }
 }
 
@@ -163,45 +169,25 @@ async function refreshOnce() {
 }
 
 // ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
-function safeEqual(a, b) {
-  const ab = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  if (ab.length !== bb.length) return false;          // length check avoids throw
-  return crypto.timingSafeEqual(ab, bb);
-}
-
-// Middleware: if API_KEY is configured, require a matching x-api-key header.
-function requireKey(req, res, next) {
-  if (!API_KEY) return next();                         // no key set -> open
-  const provided = req.get("x-api-key");
-  if (provided && safeEqual(provided, API_KEY)) return next();
-  return res.status(401).json({ error: "unauthorized" });
-}
-
-// ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
 const app = express();
 
-// Open health check (no item data exposed) -- handy for testing the deploy.
 app.get("/", (req, res) => {
   res.json({
     service: "limiteds-api",
     version: state.version,
     count: state.count,
     updated_at: state.updatedAt,
-    auth: API_KEY ? "enabled" : "open",
   });
 });
 
-// Everything below requires the key (when one is set).
-app.get("/version", requireKey, (req, res) => {
+// Cheap endpoint -- your game polls this and only re-pulls /limiteds on a change.
+app.get("/version", (req, res) => {
   res.json({ version: state.version, count: state.count, updated_at: state.updatedAt });
 });
 
-app.get("/limiteds", requireKey, (req, res) => {
+app.get("/limiteds", (req, res) => {
   res.json({
     version: state.version,
     updated_at: state.updatedAt,
@@ -210,16 +196,18 @@ app.get("/limiteds", requireKey, (req, res) => {
   });
 });
 
-app.get("/limiteds.js", requireKey, (req, res) => {
+// Original Limiteds.js format, served live. NOTE: Roblox can't use this -- it's
+// only for a JavaScript/Node consumer. Your Roblox game uses /limiteds (JSON).
+app.get("/limiteds.js", (req, res) => {
   const body = JSON.stringify(state.items, null, 2);
   const js =
-    `// v${state.version}, updated ${state.updatedAt}\n` +
+    `// Auto-generated live by limiteds_api  --  v${state.version}, updated ${state.updatedAt}\n` +
     `const Limiteds = ${body};\n\n` +
     `if (typeof module !== "undefined" && module.exports) {\n  module.exports = Limiteds;\n}\n`;
   res.type("application/javascript").send(js);
 });
 
-app.get("/limiteds/:id", requireKey, (req, res) => {
+app.get("/limiteds/:id", (req, res) => {
   const item = state.items[req.params.id];
   if (!item) return res.status(404).json({ error: "not found" });
   res.json(item);
@@ -229,14 +217,8 @@ app.get("/limiteds/:id", requireKey, (req, res) => {
 // Startup
 // ---------------------------------------------------------------------------
 async function start() {
-  if (!API_KEY) {
-    console.warn("[auth] No API_KEY set -- the API is OPEN. Set API_KEY in Railway to lock it down.");
-  } else {
-    console.log("[auth] API key required.");
-  }
-
-  loadCache();
-  await refreshOnce();
+  loadCache();            // serve from last good data if available
+  await refreshOnce();    // get fresh data ready before we start serving
   setInterval(refreshOnce, REFRESH_MS);
 
   app.listen(PORT, "0.0.0.0", () => {
