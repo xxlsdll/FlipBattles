@@ -1,29 +1,30 @@
 /**
  * limiteds_api.js  (Node.js version)
  * ----------------------------------
- * Same behaviour as the Python one: scrape Rolimon's classic limiteds on a
- * schedule, detect what changed, and serve them as JSON for your Roblox game
- * (HttpService:GetAsync + JSONDecode).
+ * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON for
+ * your Roblox game, AND exposes player token + inventory routes backed by
+ * Postgres (db.js).
  *
  * Requires Node.js 18 or newer (uses the built-in fetch).
  *
  * Local run:
- *   npm install
+ *   npm install        (express, pg)
  *   node limiteds_api.js
  *
- * Your game fetches:  https://YOUR-APP.up.railway.app/limiteds
- *
- * NEW: also exposes player-token routes backed by Postgres (db.js):
- *   GET  /players/:id        -> { user_id, tokens }      (tokens null if no row)
- *   PUT  /players/:id        -> { user_id, tokens }      (absolute balance save)
- *   POST /players/:id/add    -> { ok, tokens } | { ok:false, reason, tokens }
- * These three are protected by an x-api-key header (see API_KEY env var).
+ * Routes:
+ *   GET  /limiteds                 -> { version, updated_at, count, items }   (public)
+ *   GET  /version                  -> { version, count, updated_at }          (public)
+ *   GET  /players/:id              -> { user_id, tokens, inventory }          (key)
+ *   PUT  /players/:id              -> { user_id, tokens, inventory }          (key)
+ *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }
+ *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, reason, tokens }
+ *   GET  /players/:id/inventory    -> { user_id, count, inventory }           (key)
  */
 
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
-const db = require("./db"); // ADDED: Postgres player-token layer
+const db = require("./db"); // Postgres player layer
 
 // ---------------------------------------------------------------------------
 // Config
@@ -124,14 +125,6 @@ function applyUpdate(newItems) {
     `[update] v${state.version}  total=${state.count}  ` +
     `+${added.length} added  -${removed.length} removed  ~${changed.length} value changes`
   );
-
-  // --- OPTIONAL: push to an API you already run, instead of just serving here ---
-  // fetch("https://your-api.example.com/limiteds", {
-  //   method: "POST",
-  //   headers: { "Content-Type": "application/json", Authorization: "Bearer YOUR_SECRET" },
-  //   body: JSON.stringify({ version: state.version, items: newItems }),
-  // }).catch((e) => console.error("[push error]", e.message));
-
   return true;
 }
 
@@ -176,11 +169,33 @@ async function refreshOnce() {
 }
 
 // ---------------------------------------------------------------------------
-// API
+// App + middleware
 // ---------------------------------------------------------------------------
 const app = express();
-app.use(express.json()); // ADDED: parse JSON bodies for PUT/POST /players
+app.use(express.json());
 
+// x-api-key guard for the player routes. Set API_KEY on this service in Railway
+// equal to your Roblox GameApiKey. 500 if the var is missing (so a misconfig is
+// obvious in the logs), 401 if the key doesn't match. Both are non-2xx, so your
+// TokensService treats either as "DB unreachable" and stays on ProfileStore.
+function requireKey(req, res, next) {
+  if (!process.env.API_KEY) {
+    console.error("[auth] API_KEY env var is not set -- rejecting /players request");
+    return res.status(500).json({ error: "server_misconfigured" });
+  }
+  if (req.get("x-api-key") !== process.env.API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// Async wrapper: a thrown error becomes next(err) -> the error handler -> 500,
+// instead of an unhandled rejection.
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// ---------------------------------------------------------------------------
+// Limiteds API (public, unchanged)
+// ---------------------------------------------------------------------------
 app.get("/", (req, res) => {
   res.json({
     service: "limiteds-api",
@@ -190,7 +205,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Cheap endpoint -- your game polls this and only re-pulls /limiteds on a change.
 app.get("/version", (req, res) => {
   res.json({ version: state.version, count: state.count, updated_at: state.updatedAt });
 });
@@ -204,8 +218,6 @@ app.get("/limiteds", (req, res) => {
   });
 });
 
-// Original Limiteds.js format, served live. NOTE: Roblox can't use this -- it's
-// only for a JavaScript/Node consumer. Your Roblox game uses /limiteds (JSON).
 app.get("/limiteds.js", (req, res) => {
   const body = JSON.stringify(state.items, null, 2);
   const js =
@@ -222,84 +234,75 @@ app.get("/limiteds/:id", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Player tokens (Postgres via db.js)
-// These three routes are protected by an x-api-key header. /limiteds above stays
-// public and unchanged -- only the player routes require the key.
-//
-// IMPORTANT: set an API_KEY variable on this service in Railway equal to the
-// exact value of your Roblox GameApiKey. If it's missing, these routes return
-// 500; if it doesn't match, they return 401. In both cases your TokensService
-// falls back to ProfileStore (source=ProfileStore), so balances stay safe but
-// nothing persists to Postgres until the key lines up.
+// Player tokens + inventory (Postgres via db.js) -- protected by x-api-key
 // ---------------------------------------------------------------------------
-function requireKey(req, res, next) {
-  if (!process.env.API_KEY) {
-    console.error("[auth] API_KEY env var is not set -- rejecting /players request");
-    return res.status(500).json({ error: "server_misconfigured" });
-  }
-  if (req.get("x-api-key") !== process.env.API_KEY) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
-  next();
-}
 
-// GET balance -- 200 {tokens:null} when no row, so Roblox falls back to ProfileStore.
-app.get("/players/:id", requireKey, async (req, res) => {
-  try {
-    const tokens = await db.getTokens(req.params.id);
-    res.json({ user_id: req.params.id, tokens });
-  } catch (e) {
-    console.error("[players GET]", e.message);
-    res.status(500).json({ error: "db_error" });
-  }
-});
+// No row -> 200 with tokens:null so a brand-new player falls through to the
+// ProfileStore 100k first-join grant.
+app.get("/players/:id", requireKey, wrap(async (req, res) => {
+  const p = await db.getPlayer(req.params.id);
+  res.json({
+    user_id: req.params.id,
+    tokens: p ? p.tokens : null,
+    inventory: p ? p.inventory : null,
+  });
+}));
 
-// PUT absolute balance (session save / autosave).
-app.put("/players/:id", requireKey, async (req, res) => {
+// Absolute save (leave + 5-min autosave). inventory is optional: include the
+// array to persist it, omit it to leave the stored inventory untouched.
+app.put("/players/:id", requireKey, wrap(async (req, res) => {
   const tokens = Number(req.body.tokens);
-  if (!Number.isFinite(tokens)) {
-    return res.status(400).json({ error: "invalid_tokens" });
-  }
-  try {
-    const saved = await db.setTokens(req.params.id, tokens);
-    res.json({ user_id: req.params.id, tokens: saved });
-  } catch (e) {
-    console.error("[players PUT]", e.message);
-    res.status(500).json({ error: "db_error" });
-  }
-});
+  if (!Number.isFinite(tokens)) return res.status(400).json({ error: "invalid_tokens" });
+  const p = await db.setPlayer(req.params.id, tokens, req.body.inventory);
+  res.json({ user_id: req.params.id, tokens: p.tokens, inventory: p.inventory });
+}));
 
-// POST atomic add/spend. Body: { amount, allowNegative }. allowNegative
-// defaults to true; send false for purchases so a spend can't go below zero.
-app.post("/players/:id/add", requireKey, async (req, res) => {
+// Atomic add/spend (TrySpend). Body: { amount, allowNegative }.
+app.post("/players/:id/add", requireKey, wrap(async (req, res) => {
   const amount = Number(req.body.amount);
-  if (!Number.isFinite(amount)) {
-    return res.status(400).json({ error: "invalid_amount" });
+  if (!Number.isFinite(amount)) return res.status(400).json({ error: "invalid_amount" });
+  res.json(await db.addTokens(req.params.id, amount, req.body.allowNegative !== false));
+}));
+
+// Atomic purchase: deduct price AND append item in one transaction.
+// Body: { price, item }   item = { Id, Name, Value, AcquiredAt }
+app.post("/players/:id/purchase", requireKey, wrap(async (req, res) => {
+  const price = Number(req.body.price);
+  if (!Number.isFinite(price)) return res.status(400).json({ error: "invalid_price" });
+  if (req.body.item == null || typeof req.body.item !== "object") {
+    return res.status(400).json({ error: "invalid_item" });
   }
-  try {
-    const result = await db.addTokens(req.params.id, amount, req.body.allowNegative !== false);
-    res.json(result); // { ok, tokens } or { ok:false, reason, tokens }
-  } catch (e) {
-    console.error("[players POST add]", e.message);
-    res.status(500).json({ error: "db_error" });
-  }
+  res.json(await db.purchase(req.params.id, price, req.body.item));
+}));
+
+// Read-only inventory listing for the website/dashboard.
+app.get("/players/:id/inventory", requireKey, wrap(async (req, res) => {
+  const inventory = await db.getInventory(req.params.id);
+  res.json({ user_id: req.params.id, count: inventory.length, inventory });
+}));
+
+// ---------------------------------------------------------------------------
+// JSON 404 + error handler (must come after all routes)
+// ---------------------------------------------------------------------------
+app.use((req, res) => res.status(404).json({ error: "not_found" }));
+app.use((err, req, res, next) => {
+  console.error("[server] error:", err);
+  res.status(500).json({ error: "server_error" });
 });
 
 // ---------------------------------------------------------------------------
-// Startup
+// Startup -- DB init is wrapped so a Postgres outage can't take down the
+// limiteds feed. The scraper runs regardless; only /players degrades.
 // ---------------------------------------------------------------------------
 async function start() {
-  // Create the players table if it doesn't exist yet. Wrapped so that a DB
-  // outage at boot doesn't take down the (working) limiteds scraper -- the
-  // /players routes will just return errors until Postgres is reachable.
   try {
-    await db.init(); // logs "[db] players table ready" on success
+    await db.init(); // creates/upgrades the players table; logs "[db] players table ready"
   } catch (e) {
     console.error("[db] init failed -- /players routes will error until the DB is reachable:", e.message);
   }
 
-  loadCache();            // serve from last good data if available
-  await refreshOnce();    // get fresh data ready before we start serving
+  loadCache();
+  await refreshOnce();
   setInterval(refreshOnce, REFRESH_MS);
 
   app.listen(PORT, "0.0.0.0", () => {
