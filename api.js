@@ -12,11 +12,18 @@
  *   node limiteds_api.js
  *
  * Your game fetches:  https://YOUR-APP.up.railway.app/limiteds
+ *
+ * NEW: also exposes player-token routes backed by Postgres (db.js):
+ *   GET  /players/:id        -> { user_id, tokens }      (tokens null if no row)
+ *   PUT  /players/:id        -> { user_id, tokens }      (absolute balance save)
+ *   POST /players/:id/add    -> { ok, tokens } | { ok:false, reason, tokens }
+ * These three are protected by an x-api-key header (see API_KEY env var).
  */
 
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+const db = require("./db"); // ADDED: Postgres player-token layer
 
 // ---------------------------------------------------------------------------
 // Config
@@ -172,6 +179,7 @@ async function refreshOnce() {
 // API
 // ---------------------------------------------------------------------------
 const app = express();
+app.use(express.json()); // ADDED: parse JSON bodies for PUT/POST /players
 
 app.get("/", (req, res) => {
   res.json({
@@ -214,9 +222,82 @@ app.get("/limiteds/:id", (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Player tokens (Postgres via db.js)
+// These three routes are protected by an x-api-key header. /limiteds above stays
+// public and unchanged -- only the player routes require the key.
+//
+// IMPORTANT: set an API_KEY variable on this service in Railway equal to the
+// exact value of your Roblox GameApiKey. If it's missing, these routes return
+// 500; if it doesn't match, they return 401. In both cases your TokensService
+// falls back to ProfileStore (source=ProfileStore), so balances stay safe but
+// nothing persists to Postgres until the key lines up.
+// ---------------------------------------------------------------------------
+function requireKey(req, res, next) {
+  if (!process.env.API_KEY) {
+    console.error("[auth] API_KEY env var is not set -- rejecting /players request");
+    return res.status(500).json({ error: "server_misconfigured" });
+  }
+  if (req.get("x-api-key") !== process.env.API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// GET balance -- 200 {tokens:null} when no row, so Roblox falls back to ProfileStore.
+app.get("/players/:id", requireKey, async (req, res) => {
+  try {
+    const tokens = await db.getTokens(req.params.id);
+    res.json({ user_id: req.params.id, tokens });
+  } catch (e) {
+    console.error("[players GET]", e.message);
+    res.status(500).json({ error: "db_error" });
+  }
+});
+
+// PUT absolute balance (session save / autosave).
+app.put("/players/:id", requireKey, async (req, res) => {
+  const tokens = Number(req.body.tokens);
+  if (!Number.isFinite(tokens)) {
+    return res.status(400).json({ error: "invalid_tokens" });
+  }
+  try {
+    const saved = await db.setTokens(req.params.id, tokens);
+    res.json({ user_id: req.params.id, tokens: saved });
+  } catch (e) {
+    console.error("[players PUT]", e.message);
+    res.status(500).json({ error: "db_error" });
+  }
+});
+
+// POST atomic add/spend. Body: { amount, allowNegative }. allowNegative
+// defaults to true; send false for purchases so a spend can't go below zero.
+app.post("/players/:id/add", requireKey, async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isFinite(amount)) {
+    return res.status(400).json({ error: "invalid_amount" });
+  }
+  try {
+    const result = await db.addTokens(req.params.id, amount, req.body.allowNegative !== false);
+    res.json(result); // { ok, tokens } or { ok:false, reason, tokens }
+  } catch (e) {
+    console.error("[players POST add]", e.message);
+    res.status(500).json({ error: "db_error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 async function start() {
+  // Create the players table if it doesn't exist yet. Wrapped so that a DB
+  // outage at boot doesn't take down the (working) limiteds scraper -- the
+  // /players routes will just return errors until Postgres is reachable.
+  try {
+    await db.init(); // logs "[db] players table ready" on success
+  } catch (e) {
+    console.error("[db] init failed -- /players routes will error until the DB is reachable:", e.message);
+  }
+
   loadCache();            // serve from last good data if available
   await refreshOnce();    // get fresh data ready before we start serving
   setInterval(refreshOnce, REFRESH_MS);
