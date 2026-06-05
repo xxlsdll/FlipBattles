@@ -23,6 +23,10 @@
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
  *   GET  /battles/:id              -> full battle record                       (key)
+ *   GET  /bots/:name               -> { name, tokens, inventory }              (key)
+ *   GET  /bots/:name/inventory     -> { name, count, inventory }              (key)
+ *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
+ *   POST /bots/:name/grant         -> { ok, inventory }  (atomic append)       (key)
  */
 
 const express = require("express");
@@ -275,6 +279,28 @@ app.get("/battles/:id", requireKey, wrap(async (req, res) => {
   const b = await db.getBattle(req.params.id);
   if (!b) return res.status(404).json({ error: "not_found" });
   res.json(b);
+}));
+
+// --- Bots (the house, keyed by name) -- key required ---
+app.get("/bots/:name", requireKey, wrap(async (req, res) => {
+  const b = await db.getBot(req.params.name);
+  res.json({ name: req.params.name, tokens: b ? b.tokens : 0, inventory: b ? b.inventory : [] });
+}));
+
+app.get("/bots/:name/inventory", requireKey, wrap(async (req, res) => {
+  const b = await db.getBot(req.params.name);
+  const inventory = b ? b.inventory : [];
+  res.json({ name: req.params.name, count: inventory.length, inventory });
+}));
+
+app.post("/bots/:name/add", requireKey, wrap(async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isFinite(amount)) return res.status(400).json({ error: "invalid_amount" });
+  res.json(await db.addBotTokens(req.params.name, Math.trunc(amount)));
+}));
+
+app.post("/bots/:name/grant", requireKey, wrap(async (req, res) => {
+  res.json(await db.grantBotItems(req.params.name, req.body.items));
 }));
 
 // --- Fallbacks (after all routes) ---
