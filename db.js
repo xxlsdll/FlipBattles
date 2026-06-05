@@ -41,6 +41,15 @@ async function init() {
   await pool.query(`CREATE INDEX IF NOT EXISTS battles_created_idx ON battles (created_at DESC);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS battles_participants_idx ON battles USING GIN (participants);`);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bots (
+      name       TEXT PRIMARY KEY,
+      tokens     BIGINT NOT NULL DEFAULT 0,
+      inventory  JSONB  NOT NULL DEFAULT '[]'::jsonb,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
   console.log("[db] tables ready");
 }
 
@@ -195,7 +204,36 @@ async function playerBattles(userId, limit) {
   return rows.map((r) => r.data);
 }
 
+/* ---------------- Bots (the house, keyed by name) ---------------- */
+
+async function getBot(name) {
+  const { rows } = await pool.query("SELECT tokens, inventory FROM bots WHERE name = $1", [name]);
+  return rows.length ? { tokens: Number(rows[0].tokens), inventory: rows[0].inventory } : null;
+}
+
+async function addBotTokens(name, delta) {
+  const { rows } = await pool.query(
+    `INSERT INTO bots (name, tokens) VALUES ($1, $2)
+     ON CONFLICT (name) DO UPDATE SET tokens = bots.tokens + $2, updated_at = now()
+     RETURNING tokens`,
+    [name, Math.trunc(delta)]
+  );
+  return { ok: true, tokens: Number(rows[0].tokens) };
+}
+
+async function grantBotItems(name, items) {
+  const list = Array.isArray(items) ? items : [];
+  const { rows } = await pool.query(
+    `INSERT INTO bots (name, inventory) VALUES ($1, $2::jsonb)
+     ON CONFLICT (name) DO UPDATE SET inventory = bots.inventory || $2::jsonb, updated_at = now()
+     RETURNING inventory`,
+    [name, JSON.stringify(list)]
+  );
+  return { ok: true, inventory: rows[0].inventory };
+}
+
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
-  saveBattle, getBattle, recentBattles, playerBattles, pool,
+  saveBattle, getBattle, recentBattles, playerBattles,
+  getBot, addBotTokens, grantBotItems, pool,
 };
