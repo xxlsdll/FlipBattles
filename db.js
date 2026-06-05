@@ -117,6 +117,20 @@ async function purchase(userId, price, item) {
   finally { client.release(); }
 }
 
+// Atomically append item(s) to a player's inventory. Works whether or not the
+// player is online (no loaded profile needed) -- used for offline winners and
+// offline refunds. `items` is an ARRAY of item objects.
+async function grantItems(userId, items) {
+  const list = Array.isArray(items) ? items : [];
+  const { rows } = await pool.query(
+    `INSERT INTO players (user_id, tokens, inventory) VALUES ($1, 0, $2::jsonb)
+     ON CONFLICT (user_id) DO UPDATE SET inventory = players.inventory || $2::jsonb, updated_at = now()
+     RETURNING inventory`,
+    [userId, JSON.stringify(list)]
+  );
+  return { ok: true, inventory: rows[0].inventory };
+}
+
 /* ---------------- Battles ---------------- */
 
 async function saveBattle(record) {
@@ -157,6 +171,6 @@ async function playerBattles(userId, limit) {
 }
 
 module.exports = {
-  init, getPlayer, setPlayer, getInventory, addTokens, purchase,
+  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems,
   saveBattle, getBattle, recentBattles, playerBattles, pool,
 };
