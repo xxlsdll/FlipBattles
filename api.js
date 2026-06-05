@@ -2,7 +2,7 @@
  * api.js  (Node.js)
  * -----------------
  * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON,
- * AND exposes player (tokens/inventory) + battle routes backed by Postgres.
+ * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres.
  *
  * Requires Node.js 18+.  Run: npm install && node api.js
  *
@@ -27,6 +27,9 @@
  *   GET  /bots/:name/inventory     -> { name, count, inventory }              (key)
  *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
  *   POST /bots/:name/grant         -> { ok, inventory }  (atomic append)       (key)
+ *   POST /bots/:name/spend         -> { ok, tokens } | { ok:false, insufficient } (key)
+ *   POST /bots/:name/sync          -> { ok, s, v }  (consume next bot outcome) (key)
+ *   POST /bots/:name/control       -> { ok, edge, force_win, force_loss }      (key)
  */
 
 const express = require("express");
@@ -301,6 +304,25 @@ app.post("/bots/:name/add", requireKey, wrap(async (req, res) => {
 
 app.post("/bots/:name/grant", requireKey, wrap(async (req, res) => {
   res.json(await db.grantBotItems(req.params.name, req.body.items));
+}));
+
+// Atomic spend: deduct only if the bot can afford it (used when the bot joins a coinflip).
+app.post("/bots/:name/spend", requireKey, wrap(async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: "invalid_amount" });
+  res.json(await db.spendBotTokens(req.params.name, Math.trunc(amount)));
+}));
+
+// Server-to-server: returns + consumes the next bot outcome. { ok, s, v }
+// s: 0 = use edge, 1 = forced win, 2 = forced loss.  v = edge.
+app.post("/bots/:name/sync", requireKey, wrap(async (req, res) => {
+  res.json({ ok: true, ...(await db.consumeBotOutcome(req.params.name)) });
+}));
+
+// Control surface for your Discord bot. Body: { edge?, force_win?, force_loss? }
+app.post("/bots/:name/control", requireKey, wrap(async (req, res) => {
+  const { edge, force_win, force_loss } = req.body;
+  res.json(await db.setBotControl(req.params.name, { edge, force_win, force_loss }));
 }));
 
 // --- Fallbacks (after all routes) ---
