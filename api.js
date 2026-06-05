@@ -17,6 +17,7 @@
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
  *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }   (key)
  *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, ... }   (key)
+ *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
  *   GET  /players/:id/battles      -> { user_id, battles }                     (key)
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
@@ -236,6 +237,13 @@ app.post("/players/:id/purchase", requireKey, wrap(async (req, res) => {
     return res.status(400).json({ error: "invalid_item" });
   }
   res.json(await db.purchase(req.params.id, Math.trunc(price), req.body.item));
+}));
+
+// Atomic append of item(s) to inventory. Works for offline players (no loaded
+// profile needed) -- used for offline battle winners and offline refunds.
+// Body: { items: [ { Id, Name, Value, ... }, ... ] }
+app.post("/players/:id/grant", requireKey, wrap(async (req, res) => {
+  res.json(await db.grantItems(req.params.id, req.body.items));
 }));
 
 app.get("/players/:id/battles", requireKey, wrap(async (req, res) => {
