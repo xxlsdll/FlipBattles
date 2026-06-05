@@ -23,6 +23,7 @@ async function init() {
   `);
   // Safe to run on an existing tokens-only table:
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS inventory JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_daily_claim BIGINT NOT NULL DEFAULT 0;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
@@ -131,6 +132,30 @@ async function grantItems(userId, items) {
   return { ok: true, inventory: rows[0].inventory };
 }
 
+// Atomic daily reward: grant tokens AND stamp the claim day in one transaction,
+// so a crash can't leave the tokens granted but the claim un-recorded (which
+// would allow a double-claim). `day` is a UTC day index, e.g. floor(now/86400).
+async function claimDaily(userId, day, amount) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO players (user_id, tokens) VALUES ($1,0) ON CONFLICT (user_id) DO NOTHING", [userId]);
+    const { rows } = await client.query("SELECT tokens, last_daily_claim FROM players WHERE user_id=$1 FOR UPDATE", [userId]);
+    const last = Number(rows[0].last_daily_claim);
+    if (day <= last) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "already_claimed", tokens: Number(rows[0].tokens), lastDay: last };
+    }
+    const upd = await client.query(
+      "UPDATE players SET tokens = tokens + $2, last_daily_claim = $3, updated_at = now() WHERE user_id = $1 RETURNING tokens",
+      [userId, Math.trunc(amount), day]
+    );
+    await client.query("COMMIT");
+    return { ok: true, tokens: Number(upd.rows[0].tokens) };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+}
+
 /* ---------------- Battles ---------------- */
 
 async function saveBattle(record) {
@@ -171,6 +196,6 @@ async function playerBattles(userId, limit) {
 }
 
 module.exports = {
-  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems,
+  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
   saveBattle, getBattle, recentBattles, playerBattles, pool,
 };
