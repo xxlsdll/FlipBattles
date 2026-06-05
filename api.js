@@ -18,6 +18,7 @@
  *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }   (key)
  *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, ... }   (key)
  *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
+ *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
  *   GET  /players/:id/battles      -> { user_id, battles }                     (key)
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
@@ -244,6 +245,16 @@ app.post("/players/:id/purchase", requireKey, wrap(async (req, res) => {
 // Body: { items: [ { Id, Name, Value, ... }, ... ] }
 app.post("/players/:id/grant", requireKey, wrap(async (req, res) => {
   res.json(await db.grantItems(req.params.id, req.body.items));
+}));
+
+// Atomic daily reward. Body: { day, amount }  where day = floor(os.time()/86400).
+// The DB decides eligibility, so it's authoritative and crash-safe.
+app.post("/players/:id/daily", requireKey, wrap(async (req, res) => {
+  const day = Number(req.body.day), amount = Number(req.body.amount);
+  if (!Number.isFinite(day) || !Number.isFinite(amount) || amount < 0) {
+    return res.status(400).json({ error: "invalid" });
+  }
+  res.json(await db.claimDaily(req.params.id, Math.trunc(day), Math.trunc(amount)));
 }));
 
 app.get("/players/:id/battles", requireKey, wrap(async (req, res) => {
