@@ -1,8 +1,9 @@
 /**
  * db.js
  * -----
- * Postgres data layer: player tokens + inventory, atomic add/purchase, and
- * battle logging/history. Connects using the DATABASE_URL Railway injects.
+ * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
+ * rewards, battle logging/history, and the house bot (tokens/inventory + a
+ * server-controlled edge / forced-outcome queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -49,6 +50,10 @@ async function init() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // House controls (default edge = 10%):
+  await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS edge       DOUBLE PRECISION NOT NULL DEFAULT 0.10;`);
+  await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_win  INTEGER          NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_loss INTEGER          NOT NULL DEFAULT 0;`);
 
   console.log("[db] tables ready");
 }
@@ -232,8 +237,75 @@ async function grantBotItems(name, items) {
   return { ok: true, inventory: rows[0].inventory };
 }
 
+// Atomic spend: deduct only if the bot can afford it. The row lock serializes
+// concurrent callers so the house can't be double-spent (e.g. many players
+// calling the bot into coinflips at once).
+async function spendBotTokens(name, amount) {
+  amount = Math.trunc(amount);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+    const { rows } = await client.query("SELECT tokens FROM bots WHERE name = $1 FOR UPDATE", [name]);
+    const current = Number(rows[0].tokens);
+    if (current < amount) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "insufficient", tokens: current };
+    }
+    const upd = await client.query(
+      "UPDATE bots SET tokens = tokens - $2, updated_at = now() WHERE name = $1 RETURNING tokens",
+      [name, amount]
+    );
+    await client.query("COMMIT");
+    return { ok: true, tokens: Number(upd.rows[0].tokens) };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+}
+
+// Atomically decide + consume one outcome for the next bot game.
+// s: 0 = use edge, 1 = forced win, 2 = forced loss.  v = current edge.
+// Precedence: forced wins -> forced losses -> edge. FOR UPDATE means concurrent
+// games can't both consume the same queued win/loss.
+async function consumeBotOutcome(name) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+    const { rows } = await client.query(
+      "SELECT edge, force_win, force_loss FROM bots WHERE name = $1 FOR UPDATE", [name]);
+    const r = rows[0];
+    let s = 0;
+    if (Number(r.force_win) > 0) {
+      s = 1;
+      await client.query("UPDATE bots SET force_win = force_win - 1, updated_at = now() WHERE name = $1", [name]);
+    } else if (Number(r.force_loss) > 0) {
+      s = 2;
+      await client.query("UPDATE bots SET force_loss = force_loss - 1, updated_at = now() WHERE name = $1", [name]);
+    }
+    await client.query("COMMIT");
+    return { s, v: Number(r.edge) };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+}
+
+// Control surface for your Discord bot. Pass any of edge / force_win / force_loss;
+// omitted fields are left unchanged.
+async function setBotControl(name, { edge, force_win, force_loss }) {
+  await pool.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+  const { rows } = await pool.query(
+    `UPDATE bots SET edge       = COALESCE($2, edge),
+                     force_win  = COALESCE($3, force_win),
+                     force_loss = COALESCE($4, force_loss),
+                     updated_at = now()
+     WHERE name = $1
+     RETURNING edge, force_win, force_loss`,
+    [name, edge ?? null, force_win ?? null, force_loss ?? null]
+  );
+  return { ok: true, ...rows[0] };
+}
+
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
   saveBattle, getBattle, recentBattles, playerBattles,
-  getBot, addBotTokens, grantBotItems, pool,
+  getBot, addBotTokens, grantBotItems, spendBotTokens, consumeBotOutcome, setBotControl, pool,
 };
