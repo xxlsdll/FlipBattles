@@ -229,7 +229,7 @@ app.post("/players/:id/add", requireKey, wrap(async (req, res) => {
 }));
 
 // Atomic purchase: deduct price AND append item in one transaction.
-// Body: { price, item }   item = { Id, Name, Value, AcquiredAt }
+// Body: { price, item }   item = { Id, Name, Value }
 app.post("/players/:id/purchase", requireKey, wrap(async (req, res) => {
   const price = Number(req.body.price);
   if (!Number.isFinite(price) || price < 0) return res.status(400).json({ error: "invalid_price" });
