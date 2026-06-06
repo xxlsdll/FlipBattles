@@ -314,13 +314,14 @@ app.post("/bots/:name/spend", requireKey, wrap(async (req, res) => {
   res.json(await db.spendBotTokens(req.params.name, Math.trunc(amount)));
 }));
 
-// Atomic item stake for an item coinflip: combine held items -> single held -> buy
-// (auto-selling held items at 0% tax to fund). Body: { lo, hi, item }.
+// Atomic item stake for an item coinflip. Body: { lo, hi, items } where items is
+// the mint plan (1+ real limiteds). DB combines held items -> single held -> buys
+// the plan (auto-selling held items at 0% tax to fund).
 app.post("/bots/:name/stake", requireKey, wrap(async (req, res) => {
-  const lo = Number(req.body.lo), hi = Number(req.body.hi), item = req.body.item;
+  const lo = Number(req.body.lo), hi = Number(req.body.hi), items = req.body.items;
   if (!Number.isFinite(lo) || !Number.isFinite(hi)) return res.status(400).json({ error: "invalid_range" });
-  if (item == null || typeof item !== "object") return res.status(400).json({ error: "invalid_item" });
-  res.json(await db.stakeBotItem(req.params.name, Math.trunc(lo), Math.trunc(hi), item));
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "invalid_items" });
+  res.json(await db.stakeBotItem(req.params.name, Math.trunc(lo), Math.trunc(hi), items));
 }));
 
 // Server-to-server: returns + consumes the next bot outcome. { ok, s, v }
