@@ -28,6 +28,7 @@
  *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
  *   POST /bots/:name/grant         -> { ok, inventory }  (atomic append)       (key)
  *   POST /bots/:name/spend         -> { ok, tokens } | { ok:false, insufficient } (key)
+ *   POST /bots/:name/stake         -> { ok, items } | { ok:false, insufficient }  (key)
  *   POST /bots/:name/sync          -> { ok, s, v }  (consume next bot outcome) (key)
  *   POST /bots/:name/control       -> { ok, edge, force_win, force_loss }      (key)
  */
@@ -306,11 +307,20 @@ app.post("/bots/:name/grant", requireKey, wrap(async (req, res) => {
   res.json(await db.grantBotItems(req.params.name, req.body.items));
 }));
 
-// Atomic spend: deduct only if the bot can afford it (used when the bot joins a coinflip).
+// Atomic spend: deduct only if the bot can afford it (used when the bot joins a token coinflip).
 app.post("/bots/:name/spend", requireKey, wrap(async (req, res) => {
   const amount = Number(req.body.amount);
   if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: "invalid_amount" });
   res.json(await db.spendBotTokens(req.params.name, Math.trunc(amount)));
+}));
+
+// Atomic item stake for an item coinflip: combine held items -> single held -> buy
+// (auto-selling held items at 0% tax to fund). Body: { lo, hi, item }.
+app.post("/bots/:name/stake", requireKey, wrap(async (req, res) => {
+  const lo = Number(req.body.lo), hi = Number(req.body.hi), item = req.body.item;
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return res.status(400).json({ error: "invalid_range" });
+  if (item == null || typeof item !== "object") return res.status(400).json({ error: "invalid_item" });
+  res.json(await db.stakeBotItem(req.params.name, Math.trunc(lo), Math.trunc(hi), item));
 }));
 
 // Server-to-server: returns + consumes the next bot outcome. { ok, s, v }
