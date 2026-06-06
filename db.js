@@ -262,15 +262,16 @@ async function spendBotTokens(name, amount) {
   finally { client.release(); }
 }
 
-// Atomically acquire an item stake worth within [lo, hi] for an item coinflip.
-// 1) combine held items into the band (largest-first greedy)
-// 2) a single held item already in the band
-// 3) "buy" the whole mint plan (1+ real limiteds), auto-selling held items at
-//    0% tax to fund the total cost.
-// Bot wealth = tokens + value of its items. Returns { ok, items:[...] } or
-// { ok:false, reason:"insufficient", wealth }. Row lock => no over-commit.
-async function stakeBotItem(name, lo, hi, mintItems) {
-  const plan = Array.isArray(mintItems) ? mintItems : (mintItems ? [mintItems] : []);
+// Atomically commit an item stake the caller already planned: remove the chosen
+// held items from the bot's inventory and deduct tokens for the minted items,
+// in one transaction. The caller (CoinflipService) decides held vs mint from the
+// live market + bot state; this revalidates under a row lock and returns
+// { ok:false, reason:"retry" } if a held item is gone (bot changed meanwhile),
+// or { ok:false, reason:"insufficient" } if tokens can't cover the mints.
+// Returns { ok, items:[...] } with the full staked list (held + minted).
+async function commitBotStake(name, heldToConsume, mintItems) {
+  const held = Array.isArray(heldToConsume) ? heldToConsume : [];
+  const mint = Array.isArray(mintItems) ? mintItems : [];
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -279,48 +280,26 @@ async function stakeBotItem(name, lo, hi, mintItems) {
     let tokens = Number(rows[0].tokens);
     let inv = Array.isArray(rows[0].inventory) ? rows[0].inventory.slice() : [];
 
-    // 1) combine: largest-first greedy, pack up to hi, stop once >= lo
-    const order = inv.map((_, i) => i).sort((a, b) => Number(inv[b].Value) - Number(inv[a].Value));
-    const chosen = []; let sum = 0;
-    for (const i of order) {
-      const v = Number(inv[i].Value) || 0;
-      if (sum + v <= hi) { chosen.push(i); sum += v; if (sum >= lo) break; }
-    }
-    if (chosen.length && sum >= lo && sum <= hi) {
-      const set = new Set(chosen);
-      const items = chosen.map((i) => inv[i]);
-      inv = inv.filter((_, i) => !set.has(i));
-      await client.query("UPDATE bots SET inventory=$2::jsonb, updated_at=now() WHERE name=$1", [name, JSON.stringify(inv)]);
-      await client.query("COMMIT");
-      return { ok: true, items, source: "combine" };
+    // remove the chosen held items (one per entry, matched by Id)
+    const stakedHeld = [];
+    for (const h of held) {
+      const idx = inv.findIndex((it) => String(it.Id) === String(h.Id));
+      if (idx === -1) { await client.query("ROLLBACK"); return { ok: false, reason: "retry" }; }
+      stakedHeld.push(inv[idx]);
+      inv.splice(idx, 1);
     }
 
-    // 2) single held item in band
-    const single = inv.findIndex((it) => Number(it.Value) >= lo && Number(it.Value) <= hi);
-    if (single !== -1) {
-      const item = inv[single];
-      inv.splice(single, 1);
-      await client.query("UPDATE bots SET inventory=$2::jsonb, updated_at=now() WHERE name=$1", [name, JSON.stringify(inv)]);
-      await client.query("COMMIT");
-      return { ok: true, items: [item], source: "held" };
-    }
+    // pay for the minted items
+    const mintCost = mint.reduce((s, it) => s + Math.trunc(Number(it.Value) || 0), 0);
+    if (tokens < mintCost) { await client.query("ROLLBACK"); return { ok: false, reason: "insufficient", tokens }; }
+    tokens -= mintCost;
 
-    // 3) mint the whole plan (1+ real items), liquidating held items to fund
-    const cost = plan.reduce((s, it) => s + Math.trunc(Number(it.Value) || 0), 0);
-    if (cost <= 0) { await client.query("ROLLBACK"); return { ok: false, reason: "no_plan" }; }
-    const wealth = tokens + inv.reduce((s, it) => s + (Number(it.Value) || 0), 0);
-    if (wealth < cost) {
-      await client.query("ROLLBACK");
-      return { ok: false, reason: "insufficient", wealth };
-    }
-    inv.sort((a, b) => Number(b.Value) - Number(a.Value));
-    while (tokens < cost && inv.length) tokens += Number(inv.shift().Value) || 0;
-    tokens -= cost;
     await client.query("UPDATE bots SET tokens=$2, inventory=$3::jsonb, updated_at=now() WHERE name=$1",
       [name, Math.trunc(tokens), JSON.stringify(inv)]);
     await client.query("COMMIT");
-    const items = plan.map((it) => ({ Id: it.Id, Name: it.Name, Value: Math.trunc(Number(it.Value) || 0) }));
-    return { ok: true, items, source: "mint" };
+
+    const items = stakedHeld.concat(mint.map((it) => ({ Id: it.Id, Name: it.Name, Value: Math.trunc(Number(it.Value) || 0) })));
+    return { ok: true, items };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
 }
@@ -370,5 +349,5 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
   saveBattle, getBattle, recentBattles, playerBattles,
-  getBot, addBotTokens, grantBotItems, spendBotTokens, stakeBotItem, consumeBotOutcome, setBotControl, pool,
+  getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl, pool,
 };
