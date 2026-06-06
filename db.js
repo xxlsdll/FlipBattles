@@ -265,10 +265,12 @@ async function spendBotTokens(name, amount) {
 // Atomically acquire an item stake worth within [lo, hi] for an item coinflip.
 // 1) combine held items into the band (largest-first greedy)
 // 2) a single held item already in the band
-// 3) "buy" mintItem, auto-selling held items at 0% tax to fund the cost.
+// 3) "buy" the whole mint plan (1+ real limiteds), auto-selling held items at
+//    0% tax to fund the total cost.
 // Bot wealth = tokens + value of its items. Returns { ok, items:[...] } or
 // { ok:false, reason:"insufficient", wealth }. Row lock => no over-commit.
-async function stakeBotItem(name, lo, hi, mintItem) {
+async function stakeBotItem(name, lo, hi, mintItems) {
+  const plan = Array.isArray(mintItems) ? mintItems : (mintItems ? [mintItems] : []);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -303,8 +305,9 @@ async function stakeBotItem(name, lo, hi, mintItem) {
       return { ok: true, items: [item], source: "held" };
     }
 
-    // 3) mint mintItem, liquidating items (0% tax) to fund the cost
-    const cost = Math.trunc(Number(mintItem.Value));
+    // 3) mint the whole plan (1+ real items), liquidating held items to fund
+    const cost = plan.reduce((s, it) => s + Math.trunc(Number(it.Value) || 0), 0);
+    if (cost <= 0) { await client.query("ROLLBACK"); return { ok: false, reason: "no_plan" }; }
     const wealth = tokens + inv.reduce((s, it) => s + (Number(it.Value) || 0), 0);
     if (wealth < cost) {
       await client.query("ROLLBACK");
@@ -316,7 +319,8 @@ async function stakeBotItem(name, lo, hi, mintItem) {
     await client.query("UPDATE bots SET tokens=$2, inventory=$3::jsonb, updated_at=now() WHERE name=$1",
       [name, Math.trunc(tokens), JSON.stringify(inv)]);
     await client.query("COMMIT");
-    return { ok: true, items: [{ Id: mintItem.Id, Name: mintItem.Name, Value: cost }], source: "mint" };
+    const items = plan.map((it) => ({ Id: it.Id, Name: it.Name, Value: Math.trunc(Number(it.Value) || 0) }));
+    return { ok: true, items, source: "mint" };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
 }
