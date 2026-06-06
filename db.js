@@ -262,6 +262,65 @@ async function spendBotTokens(name, amount) {
   finally { client.release(); }
 }
 
+// Atomically acquire an item stake worth within [lo, hi] for an item coinflip.
+// 1) combine held items into the band (largest-first greedy)
+// 2) a single held item already in the band
+// 3) "buy" mintItem, auto-selling held items at 0% tax to fund the cost.
+// Bot wealth = tokens + value of its items. Returns { ok, items:[...] } or
+// { ok:false, reason:"insufficient", wealth }. Row lock => no over-commit.
+async function stakeBotItem(name, lo, hi, mintItem) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+    const { rows } = await client.query("SELECT tokens, inventory FROM bots WHERE name=$1 FOR UPDATE", [name]);
+    let tokens = Number(rows[0].tokens);
+    let inv = Array.isArray(rows[0].inventory) ? rows[0].inventory.slice() : [];
+
+    // 1) combine: largest-first greedy, pack up to hi, stop once >= lo
+    const order = inv.map((_, i) => i).sort((a, b) => Number(inv[b].Value) - Number(inv[a].Value));
+    const chosen = []; let sum = 0;
+    for (const i of order) {
+      const v = Number(inv[i].Value) || 0;
+      if (sum + v <= hi) { chosen.push(i); sum += v; if (sum >= lo) break; }
+    }
+    if (chosen.length && sum >= lo && sum <= hi) {
+      const set = new Set(chosen);
+      const items = chosen.map((i) => inv[i]);
+      inv = inv.filter((_, i) => !set.has(i));
+      await client.query("UPDATE bots SET inventory=$2::jsonb, updated_at=now() WHERE name=$1", [name, JSON.stringify(inv)]);
+      await client.query("COMMIT");
+      return { ok: true, items, source: "combine" };
+    }
+
+    // 2) single held item in band
+    const single = inv.findIndex((it) => Number(it.Value) >= lo && Number(it.Value) <= hi);
+    if (single !== -1) {
+      const item = inv[single];
+      inv.splice(single, 1);
+      await client.query("UPDATE bots SET inventory=$2::jsonb, updated_at=now() WHERE name=$1", [name, JSON.stringify(inv)]);
+      await client.query("COMMIT");
+      return { ok: true, items: [item], source: "held" };
+    }
+
+    // 3) mint mintItem, liquidating items (0% tax) to fund the cost
+    const cost = Math.trunc(Number(mintItem.Value));
+    const wealth = tokens + inv.reduce((s, it) => s + (Number(it.Value) || 0), 0);
+    if (wealth < cost) {
+      await client.query("ROLLBACK");
+      return { ok: false, reason: "insufficient", wealth };
+    }
+    inv.sort((a, b) => Number(b.Value) - Number(a.Value));
+    while (tokens < cost && inv.length) tokens += Number(inv.shift().Value) || 0;
+    tokens -= cost;
+    await client.query("UPDATE bots SET tokens=$2, inventory=$3::jsonb, updated_at=now() WHERE name=$1",
+      [name, Math.trunc(tokens), JSON.stringify(inv)]);
+    await client.query("COMMIT");
+    return { ok: true, items: [{ Id: mintItem.Id, Name: mintItem.Name, Value: cost }], source: "mint" };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+}
+
 // Atomically decide + consume one outcome for the next bot game.
 // s: 0 = use edge, 1 = forced win, 2 = forced loss.  v = current edge.
 // Precedence: forced wins -> forced losses -> edge. FOR UPDATE means concurrent
@@ -307,5 +366,5 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
   saveBattle, getBattle, recentBattles, playerBattles,
-  getBot, addBotTokens, grantBotItems, spendBotTokens, consumeBotOutcome, setBotControl, pool,
+  getBot, addBotTokens, grantBotItems, spendBotTokens, stakeBotItem, consumeBotOutcome, setBotControl, pool,
 };
