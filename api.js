@@ -28,7 +28,7 @@
  *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
  *   POST /bots/:name/grant         -> { ok, inventory }  (atomic append)       (key)
  *   POST /bots/:name/spend         -> { ok, tokens } | { ok:false, insufficient } (key)
- *   POST /bots/:name/stake         -> { ok, items } | { ok:false, insufficient }  (key)
+ *   POST /bots/:name/stake         -> { ok, items } | { ok:false, retry|insufficient }  (key)
  *   POST /bots/:name/sync          -> { ok, s, v }  (consume next bot outcome) (key)
  *   POST /bots/:name/control       -> { ok, edge, force_win, force_loss }      (key)
  */
@@ -314,14 +314,12 @@ app.post("/bots/:name/spend", requireKey, wrap(async (req, res) => {
   res.json(await db.spendBotTokens(req.params.name, Math.trunc(amount)));
 }));
 
-// Atomic item stake for an item coinflip. Body: { lo, hi, items } where items is
-// the mint plan (1+ real limiteds). DB combines held items -> single held -> buys
-// the plan (auto-selling held items at 0% tax to fund).
+// Atomic item stake for an item coinflip. Body: { held, mint } -- the caller
+// (CoinflipService) planned which held items to consume + which to buy from the
+// live market. The DB removes the held items + deducts tokens for the mints in
+// one transaction, returning { ok:false, reason:"retry" } if the bot changed.
 app.post("/bots/:name/stake", requireKey, wrap(async (req, res) => {
-  const lo = Number(req.body.lo), hi = Number(req.body.hi), items = req.body.items;
-  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return res.status(400).json({ error: "invalid_range" });
-  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "invalid_items" });
-  res.json(await db.stakeBotItem(req.params.name, Math.trunc(lo), Math.trunc(hi), items));
+  res.json(await db.commitBotStake(req.params.name, req.body.held, req.body.mint));
 }));
 
 // Server-to-server: returns + consumes the next bot outcome. { ok, s, v }
