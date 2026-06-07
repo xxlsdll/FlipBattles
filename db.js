@@ -2,8 +2,9 @@
  * db.js
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, battle logging/history, and the house bot (tokens/inventory + a
- * server-controlled edge / forced-outcome queue). Connects using DATABASE_URL.
+ * rewards, all-time wagered, leaderboards, battle logging/history, and the
+ * house bot (tokens/inventory + a server-controlled edge / forced-outcome
+ * queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -25,6 +26,7 @@ async function init() {
   // Safe to run on an existing tokens-only table:
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS inventory JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_daily_claim BIGINT NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wagered BIGINT NOT NULL DEFAULT 0;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
@@ -61,26 +63,31 @@ async function init() {
 /* ---------------- Players ---------------- */
 
 async function getPlayer(userId) {
-  const { rows } = await pool.query("SELECT tokens, inventory FROM players WHERE user_id = $1", [userId]);
-  return rows.length ? { tokens: Number(rows[0].tokens), inventory: rows[0].inventory } : null;
+  const { rows } = await pool.query("SELECT tokens, inventory, wagered FROM players WHERE user_id = $1", [userId]);
+  return rows.length
+    ? { tokens: Number(rows[0].tokens), inventory: rows[0].inventory, wagered: Number(rows[0].wagered) }
+    : null;
 }
 
 // Partial update: only the fields you pass are changed. Omitted fields keep
 // their existing value (so a token-only save can't wipe the inventory).
-async function setPlayer(userId, tokens, inventory) {
+// wagered is monotonic -- GREATEST guards against an absolute save lowering it.
+async function setPlayer(userId, tokens, inventory, wagered) {
   const tokParam = tokens === undefined || tokens === null ? null : Math.trunc(tokens);
   const invParam = inventory === undefined || inventory === null ? null : JSON.stringify(inventory);
+  const wagParam = wagered === undefined || wagered === null ? null : Math.trunc(wagered);
   const { rows } = await pool.query(
-    `INSERT INTO players (user_id, tokens, inventory)
-       VALUES ($1, COALESCE($2::bigint, 0), COALESCE($3::jsonb, '[]'::jsonb))
+    `INSERT INTO players (user_id, tokens, inventory, wagered)
+       VALUES ($1, COALESCE($2::bigint, 0), COALESCE($3::jsonb, '[]'::jsonb), COALESCE($4::bigint, 0))
      ON CONFLICT (user_id) DO UPDATE
        SET tokens     = COALESCE($2::bigint, players.tokens),
            inventory  = COALESCE($3::jsonb, players.inventory),
+           wagered    = GREATEST(players.wagered, COALESCE($4::bigint, players.wagered)),
            updated_at = now()
-     RETURNING tokens, inventory`,
-    [userId, tokParam, invParam]
+     RETURNING tokens, inventory, wagered`,
+    [userId, tokParam, invParam, wagParam]
   );
-  return { tokens: Number(rows[0].tokens), inventory: rows[0].inventory };
+  return { tokens: Number(rows[0].tokens), inventory: rows[0].inventory, wagered: Number(rows[0].wagered) };
 }
 
 async function getInventory(userId) {
@@ -168,6 +175,51 @@ async function claimDaily(userId, day, amount) {
     return { ok: true, tokens: Number(upd.rows[0].tokens) };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
+}
+
+// Atomic increment of all-time wagered. Used for offline participants when a
+// battle resolves; online players persist their absolute total via setPlayer.
+async function addWagered(userId, amount) {
+  const delta = Math.trunc(amount);
+  const { rows } = await pool.query(
+    `INSERT INTO players (user_id, wagered) VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET wagered = players.wagered + $2, updated_at = now()
+     RETURNING wagered`,
+    [userId, delta]
+  );
+  return { ok: true, wagered: Number(rows[0].wagered) };
+}
+
+/* ---------------- Leaderboards ---------------- */
+
+// Global top-N boards. Each board is an array of { userId, value }, descending.
+//   value   = summed inventory worth (sum of each item's Value)
+//   wagered = all-time wagered
+//   tokens  = current token balance
+async function leaderboard(limit) {
+  const n = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
+
+  const tokensQ = pool.query(
+    "SELECT user_id, tokens AS value FROM players ORDER BY tokens DESC LIMIT $1", [n]);
+
+  const wageredQ = pool.query(
+    "SELECT user_id, wagered AS value FROM players ORDER BY wagered DESC LIMIT $1", [n]);
+
+  // Inventory items are stored as { Id, Name, Value }; fall back to lowercase
+  // just in case an older row used `value`.
+  const valueQ = pool.query(
+    `SELECT user_id,
+            COALESCE((
+              SELECT SUM(COALESCE((elem->>'Value')::numeric, (elem->>'value')::numeric, 0))
+              FROM jsonb_array_elements(inventory) elem
+            ), 0) AS value
+       FROM players
+      ORDER BY value DESC
+      LIMIT $1`, [n]);
+
+  const [tokens, wagered, value] = await Promise.all([tokensQ, wageredQ, valueQ]);
+  const map = (r) => r.rows.map((row) => ({ userId: Number(row.user_id), value: Number(row.value) }));
+  return { value: map(value), wagered: map(wagered), tokens: map(tokens) };
 }
 
 /* ---------------- Battles ---------------- */
@@ -347,7 +399,7 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 }
 
 module.exports = {
-  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily,
+  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered, leaderboard,
   saveBattle, getBattle, recentBattles, playerBattles,
   getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl, pool,
 };
