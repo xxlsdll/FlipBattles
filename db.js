@@ -2,11 +2,11 @@
  * db.js
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, all-time wagered, leaderboards (dedicated snapshot table, refreshed
- * on-write with a debounce + a periodic fallback), redeem codes (atomic, with
- * max-uses / expiry / once-per-player), battle logging/history, and the house
- * bot (tokens/inventory + a server-controlled edge / forced-outcome queue).
- * Connects using DATABASE_URL.
+ * rewards, all-time wagered, per-player game stats (bet / profit / games), 
+ * leaderboards (dedicated snapshot table, refreshed on-write with a debounce +
+ * a periodic fallback), redeem codes (atomic, with max-uses / expiry /
+ * once-per-player), battle logging/history, and the house bot (tokens/inventory
+ * + a server-controlled edge / forced-outcome queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -29,6 +29,14 @@ async function init() {
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS inventory JSONB NOT NULL DEFAULT '[]'::jsonb;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_daily_claim BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wagered BIGINT NOT NULL DEFAULT 0;`);
+  // Per-player game stats:
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS tokens_bet    BIGINT  NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS value_bet     BIGINT  NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS tokens_profit BIGINT  NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS value_profit  BIGINT  NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_played  INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_won     INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_lost    INTEGER NOT NULL DEFAULT 0;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
@@ -231,6 +239,59 @@ async function addWagered(userId, amount) {
   );
   markLeaderboardDirty();
   return { ok: true, wagered: Number(rows[0].wagered) };
+}
+
+/* ---------------- Player stats ---------------- */
+
+function mapStats(r) {
+  return {
+    tokensBet: Number(r.tokens_bet || 0),
+    valueBet: Number(r.value_bet || 0),
+    tokensProfit: Number(r.tokens_profit || 0),
+    valueProfit: Number(r.value_profit || 0),
+    gamesPlayed: Number(r.games_played || 0),
+    gamesWon: Number(r.games_won || 0),
+    gamesLost: Number(r.games_lost || 0),
+  };
+}
+
+// Record one resolved game for a player. Profit is net, bucketed by stake type:
+// win => +opponentValue, loss => -bet, into tokens_* or value_* by betType.
+// Also bumps `wagered` (= bet) so the wagered leaderboard stays consistent.
+async function recordGame(userId, { bet, betType, opponentValue, won }) {
+  bet = Math.max(0, Math.trunc(Number(bet) || 0));
+  const opp = Math.max(0, Math.trunc(Number(opponentValue) || 0));
+  const profit = won ? opp : -bet;
+  const isTokens = betType === "tokens";
+  const tb = isTokens ? bet : 0,    vb = isTokens ? 0 : bet;
+  const tp = isTokens ? profit : 0, vp = isTokens ? 0 : profit;
+  const w = won ? 1 : 0,            l = won ? 0 : 1;
+
+  const { rows } = await pool.query(
+    `INSERT INTO players (user_id, wagered, tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8)
+     ON CONFLICT (user_id) DO UPDATE SET
+       wagered       = players.wagered       + $2,
+       tokens_bet    = players.tokens_bet    + $3,
+       value_bet     = players.value_bet     + $4,
+       tokens_profit = players.tokens_profit + $5,
+       value_profit  = players.value_profit  + $6,
+       games_played  = players.games_played  + 1,
+       games_won     = players.games_won     + $7,
+       games_lost    = players.games_lost    + $8,
+       updated_at = now()
+     RETURNING tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost`,
+    [userId, bet, tb, vb, tp, vp, w, l]
+  );
+  markLeaderboardDirty();
+  return { ok: true, stats: mapStats(rows[0]) };
+}
+
+async function getStats(userId) {
+  const { rows } = await pool.query(
+    `SELECT tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost
+       FROM players WHERE user_id = $1`, [userId]);
+  return mapStats(rows.length ? rows[0] : {});
 }
 
 /* ---------------- Leaderboards ---------------- */
@@ -590,6 +651,7 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered,
+  recordGame, getStats,
   computeBoards, refreshLeaderboard, leaderboard,
   redeemCode, getActiveCodes, getCode, upsertCode, setCodeActive,
   saveBattle, getBattle, recentBattles, playerBattles,
