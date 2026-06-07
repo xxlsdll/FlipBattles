@@ -3,9 +3,10 @@
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
  * rewards, all-time wagered, leaderboards (dedicated snapshot table, refreshed
- * on-write with a debounce + a periodic fallback), battle logging/history, and
- * the house bot (tokens/inventory + a server-controlled edge / forced-outcome
- * queue). Connects using DATABASE_URL.
+ * on-write with a debounce + a periodic fallback), redeem codes (atomic, with
+ * max-uses / expiry / once-per-player), battle logging/history, and the house
+ * bot (tokens/inventory + a server-controlled edge / forced-outcome queue).
+ * Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -67,6 +68,29 @@ async function init() {
       value      BIGINT  NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       PRIMARY KEY (board, rank)
+    );
+  `);
+
+  // Redeem codes + per-player redemption ledger.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS codes (
+      code        TEXT PRIMARY KEY,
+      tokens      BIGINT  NOT NULL DEFAULT 0,
+      max_uses    INTEGER,                 -- NULL = unlimited
+      uses        INTEGER NOT NULL DEFAULT 0,
+      expires_at  TIMESTAMPTZ,             -- NULL = never expires
+      active      BOOLEAN NOT NULL DEFAULT true,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS code_redemptions (
+      code        TEXT   NOT NULL,
+      user_id     BIGINT NOT NULL,
+      tokens      BIGINT NOT NULL,
+      redeemed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (code, user_id)
     );
   `);
 
@@ -287,6 +311,107 @@ async function leaderboard(limit) {
   return out;
 }
 
+/* ---------------- Codes ---------------- */
+
+// Authoritative redeem. Under a row lock on the code, validates active / expiry /
+// max-uses / not-already-redeemed, records the redemption, bumps the use count,
+// and grants tokens -- all in one transaction (crash-safe, no double-grant).
+async function redeemCode(code, userId) {
+  code = String(code).toUpperCase();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      "SELECT tokens, max_uses, uses, expires_at, active FROM codes WHERE code = $1 FOR UPDATE", [code]);
+    if (!rows.length) { await client.query("ROLLBACK"); return { ok: false, reason: "invalid_code" }; }
+
+    const c = rows[0];
+    if (!c.active) { await client.query("ROLLBACK"); return { ok: false, reason: "inactive" }; }
+    if (c.expires_at && new Date(c.expires_at).getTime() <= Date.now()) {
+      await client.query("ROLLBACK"); return { ok: false, reason: "expired" };
+    }
+    if (c.max_uses != null && Number(c.uses) >= Number(c.max_uses)) {
+      await client.query("ROLLBACK"); return { ok: false, reason: "maxed" };
+    }
+
+    const reward = Number(c.tokens);
+    const ins = await client.query(
+      "INSERT INTO code_redemptions (code, user_id, tokens) VALUES ($1,$2,$3) ON CONFLICT (code, user_id) DO NOTHING",
+      [code, userId, reward]
+    );
+    if (ins.rowCount === 0) { await client.query("ROLLBACK"); return { ok: false, reason: "already_redeemed" }; }
+
+    await client.query("UPDATE codes SET uses = uses + 1, updated_at = now() WHERE code = $1", [code]);
+    await client.query("INSERT INTO players (user_id, tokens) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING", [userId]);
+    const upd = await client.query(
+      "UPDATE players SET tokens = tokens + $2, updated_at = now() WHERE user_id = $1 RETURNING tokens",
+      [userId, reward]
+    );
+    await client.query("COMMIT");
+    markLeaderboardDirty();
+    return { ok: true, tokens: Number(upd.rows[0].tokens), reward };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+}
+
+// Active, non-expired, non-maxed codes (for listing / a future UI).
+async function getActiveCodes() {
+  const { rows } = await pool.query(
+    `SELECT code, tokens, max_uses, uses, expires_at
+       FROM codes
+      WHERE active = true
+        AND (expires_at IS NULL OR expires_at > now())
+        AND (max_uses IS NULL OR uses < max_uses)
+      ORDER BY created_at DESC`);
+  return rows.map((r) => ({
+    code: r.code, tokens: Number(r.tokens),
+    maxUses: r.max_uses == null ? null : Number(r.max_uses),
+    uses: Number(r.uses), expiresAt: r.expires_at,
+  }));
+}
+
+async function getCode(code) {
+  const { rows } = await pool.query("SELECT * FROM codes WHERE code = $1", [String(code).toUpperCase()]);
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    code: r.code, tokens: Number(r.tokens),
+    maxUses: r.max_uses == null ? null : Number(r.max_uses),
+    uses: Number(r.uses), expiresAt: r.expires_at, active: r.active,
+    created_at: r.created_at, updated_at: r.updated_at,
+  };
+}
+
+// Create/replace a code (your Discord bot later). Sets tokens, max_uses
+// (null=unlimited), expires_at (null=never), active.
+async function upsertCode(code, { tokens, maxUses, expiresAt, active }) {
+  code = String(code).toUpperCase();
+  const { rows } = await pool.query(
+    `INSERT INTO codes (code, tokens, max_uses, expires_at, active)
+       VALUES ($1, COALESCE($2,0), $3, $4, COALESCE($5, true))
+     ON CONFLICT (code) DO UPDATE SET
+       tokens     = COALESCE($2, codes.tokens),
+       max_uses   = $3,
+       expires_at = $4,
+       active     = COALESCE($5, codes.active),
+       updated_at = now()
+     RETURNING code`,
+    [code, tokens == null ? null : Math.trunc(tokens),
+     maxUses == null ? null : Math.trunc(maxUses), expiresAt ?? null,
+     typeof active === "boolean" ? active : null]
+  );
+  return { ok: true, code: rows[0].code };
+}
+
+async function setCodeActive(code, active) {
+  const { rows } = await pool.query(
+    "UPDATE codes SET active = $2, updated_at = now() WHERE code = $1 RETURNING code, active",
+    [String(code).toUpperCase(), !!active]
+  );
+  if (!rows.length) return { ok: false, reason: "invalid_code" };
+  return { ok: true, code: rows[0].code, active: rows[0].active };
+}
+
 /* ---------------- Battles ---------------- */
 
 async function saveBattle(record) {
@@ -466,6 +591,7 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered,
   computeBoards, refreshLeaderboard, leaderboard,
+  redeemCode, getActiveCodes, getCode, upsertCode, setCodeActive,
   saveBattle, getBattle, recentBattles, playerBattles,
   getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl, pool,
 };
