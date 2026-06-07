@@ -16,6 +16,7 @@
  *   PUT  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
  *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }   (key)
+ *   POST /players/:id/give         -> { ok, tokens }  (grant + instant push)    (key)
  *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, ... }   (key)
  *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
  *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
@@ -62,6 +63,11 @@ const PORT = process.env.PORT || 8080;
 
 // Set this in Railway -> Variables, equal to your Roblox GameApiKey.
 const API_KEY = process.env.API_KEY || "";
+
+// Roblox Open Cloud -- for instant token pushes to live servers via MessagingService.
+const OPEN_CLOUD_KEY = process.env.OPEN_CLOUD_KEY || "";  // key w/ messaging-service publish scope
+const UNIVERSE_ID = process.env.UNIVERSE_ID || "";        // experience's Universe ID (not place ID)
+const SYNC_TOPIC = "TokenSync";                           // must match TokensConfig.SyncTopic
 
 const HEADERS = {
   "User-Agent":
@@ -178,6 +184,25 @@ function requireKey(req, res, next) {
   next();
 }
 
+// Push a player's new balance to live game servers via Open Cloud MessagingService.
+// Best-effort: logs and returns false if creds are missing or the call fails.
+async function publishTokens(userId, tokens) {
+  if (!OPEN_CLOUD_KEY || !UNIVERSE_ID) {
+    console.warn("[push] OPEN_CLOUD_KEY / UNIVERSE_ID not set -- instant push skipped");
+    return false;
+  }
+  const url = `https://apis.roblox.com/messaging-service/v1/universes/${UNIVERSE_ID}/topics/${SYNC_TOPIC}`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "x-api-key": OPEN_CLOUD_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: JSON.stringify({ userId: Number(userId), tokens: Number(tokens) }) }),
+    });
+    if (!resp.ok) { console.error("[push] messaging HTTP", resp.status); return false; }
+    return true;
+  } catch (e) { console.error("[push] error:", e.message); return false; }
+}
+
 // Async wrapper: a thrown error becomes next(err) -> error handler -> 500.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -254,6 +279,17 @@ app.post("/players/:id/add", requireKey, wrap(async (req, res) => {
   const amount = Number(req.body.amount);
   if (!Number.isFinite(amount)) return res.status(400).json({ error: "invalid_amount" });
   res.json(await db.addTokens(req.params.id, Math.trunc(amount), req.body.allowNegative !== false));
+}));
+
+// Grant (or remove, if negative) tokens and instantly push the new balance to
+// live servers via Open Cloud MessagingService. Body: { amount }.
+// This is the endpoint your Discord bot / admin tools should call.
+app.post("/players/:id/give", requireKey, wrap(async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isFinite(amount)) return res.status(400).json({ error: "invalid_amount" });
+  const result = await db.addTokens(req.params.id, Math.trunc(amount), req.body.allowNegative !== false);
+  if (result.ok) await publishTokens(req.params.id, result.tokens);
+  res.json(result);
 }));
 
 // Atomic purchase: deduct price AND append item in one transaction.
@@ -429,6 +465,7 @@ app.use((err, req, res, next) => { console.error("[server] error:", err); res.st
 // ---------------------------------------------------------------------------
 async function start() {
   if (!API_KEY) console.warn("[auth] No API_KEY set -- protected routes will return 500 until it's set.");
+  if (!OPEN_CLOUD_KEY || !UNIVERSE_ID) console.warn("[push] OPEN_CLOUD_KEY / UNIVERSE_ID not set -- /give will skip the instant push.");
 
   loadCache();
   await refreshOnce();
