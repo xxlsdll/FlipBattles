@@ -20,6 +20,8 @@
  *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
  *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
  *   POST /players/:id/wager        -> { ok, wagered }  (atomic increment)       (key)
+ *   POST /players/:id/game         -> { ok, stats }  (record a resolved game)   (key)
+ *   GET  /players/:id/stats        -> { user_id, stats }                        (key)
  *   GET  /players/:id/battles      -> { user_id, battles }                     (key)
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
@@ -289,6 +291,19 @@ app.post("/players/:id/wager", requireKey, wrap(async (req, res) => {
   const amount = Number(req.body.amount);
   if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "invalid_amount" });
   res.json(await db.addWagered(req.params.id, Math.trunc(amount)));
+}));
+
+// Record one resolved game (stats). Body: { bet, betType: "tokens"|"value", opponentValue, won }.
+// Bumps tokens/value bet + profit + games played/won/lost (and wagered) atomically.
+app.post("/players/:id/game", requireKey, wrap(async (req, res) => {
+  const { bet, betType, opponentValue, won } = req.body;
+  if (!Number.isFinite(Number(bet)) || Number(bet) < 0) return res.status(400).json({ error: "invalid_bet" });
+  if (betType !== "tokens" && betType !== "value") return res.status(400).json({ error: "invalid_bet_type" });
+  res.json(await db.recordGame(req.params.id, { bet, betType, opponentValue, won: won === true }));
+}));
+
+app.get("/players/:id/stats", requireKey, wrap(async (req, res) => {
+  res.json({ user_id: req.params.id, stats: await db.getStats(req.params.id) });
 }));
 
 app.get("/players/:id/battles", requireKey, wrap(async (req, res) => {
