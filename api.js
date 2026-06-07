@@ -12,17 +12,19 @@
  *   GET  /version                  -> { version, count, updated_at }            (public)
  *   GET  /limiteds.js              -> const Limiteds = {...}  (JS consumers)     (public)
  *   GET  /limiteds/:id             -> single item                               (public)
- *   GET  /players/:id              -> { user_id, tokens, inventory }            (key)
- *   PUT  /players/:id              -> { user_id, tokens, inventory }            (key)
+ *   GET  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
+ *   PUT  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
  *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }   (key)
  *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, ... }   (key)
  *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
  *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
+ *   POST /players/:id/wager        -> { ok, wagered }  (atomic increment)       (key)
  *   GET  /players/:id/battles      -> { user_id, battles }                     (key)
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
  *   GET  /battles/:id              -> full battle record                       (key)
+ *   GET  /leaderboard              -> { value, wagered, tokens }  (top-N each)  (key)
  *   GET  /bots/:name               -> { name, tokens, inventory }              (key)
  *   GET  /bots/:name/inventory     -> { name, count, inventory }              (key)
  *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
@@ -211,18 +213,27 @@ app.get("/limiteds/:id", (req, res) => {
 // ProfileStore first-join grant.
 app.get("/players/:id", requireKey, wrap(async (req, res) => {
   const p = await db.getPlayer(req.params.id);
-  res.json({ user_id: req.params.id, tokens: p ? p.tokens : null, inventory: p ? p.inventory : null });
+  res.json({
+    user_id: req.params.id,
+    tokens: p ? p.tokens : null,
+    inventory: p ? p.inventory : null,
+    wagered: p ? p.wagered : null,
+  });
 }));
 
 // Absolute save. inventory is optional: include it to persist, omit to leave
 // the stored inventory untouched (so a token-only save can't wipe it).
+// wagered is optional too and is clamped monotonically (never decreases).
 app.put("/players/:id", requireKey, wrap(async (req, res) => {
-  const { tokens, inventory } = req.body;
+  const { tokens, inventory, wagered } = req.body;
   if (tokens !== undefined && tokens !== null && !Number.isFinite(Number(tokens))) {
     return res.status(400).json({ error: "invalid_tokens" });
   }
-  const p = await db.setPlayer(req.params.id, tokens, inventory);
-  res.json({ user_id: req.params.id, tokens: p.tokens, inventory: p.inventory });
+  if (wagered !== undefined && wagered !== null && !Number.isFinite(Number(wagered))) {
+    return res.status(400).json({ error: "invalid_wagered" });
+  }
+  const p = await db.setPlayer(req.params.id, tokens, inventory, wagered);
+  res.json({ user_id: req.params.id, tokens: p.tokens, inventory: p.inventory, wagered: p.wagered });
 }));
 
 app.get("/players/:id/inventory", requireKey, wrap(async (req, res) => {
@@ -265,6 +276,15 @@ app.post("/players/:id/daily", requireKey, wrap(async (req, res) => {
   res.json(await db.claimDaily(req.params.id, Math.trunc(day), Math.trunc(amount)));
 }));
 
+// Atomic increment of all-time wagered. Body: { amount }  (amount > 0).
+// Used for offline participants when a battle resolves; online players persist
+// their absolute total through PUT /players/:id.
+app.post("/players/:id/wager", requireKey, wrap(async (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ error: "invalid_amount" });
+  res.json(await db.addWagered(req.params.id, Math.trunc(amount)));
+}));
+
 app.get("/players/:id/battles", requireKey, wrap(async (req, res) => {
   res.json({ user_id: req.params.id, battles: await db.playerBattles(req.params.id, req.query.limit) });
 }));
@@ -283,6 +303,13 @@ app.get("/battles/:id", requireKey, wrap(async (req, res) => {
   const b = await db.getBattle(req.params.id);
   if (!b) return res.status(404).json({ error: "not_found" });
   res.json(b);
+}));
+
+// --- Leaderboard (global top-N) -- key required ---
+// { value, wagered, tokens } -- each an array of { userId, value }, desc.
+// value board = summed inventory worth; ?limit= (default 10, max 100).
+app.get("/leaderboard", requireKey, wrap(async (req, res) => {
+  res.json(await db.leaderboard(req.query.limit));
 }));
 
 // --- Bots (the house, keyed by name) -- key required ---
