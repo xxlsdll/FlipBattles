@@ -2,9 +2,9 @@
  * db.js
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, all-time wagered, leaderboards, battle logging/history, and the
- * house bot (tokens/inventory + a server-controlled edge / forced-outcome
- * queue). Connects using DATABASE_URL.
+ * rewards, all-time wagered, leaderboards (dedicated snapshot table), battle
+ * logging/history, and the house bot (tokens/inventory + a server-controlled
+ * edge / forced-outcome queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -56,6 +56,18 @@ async function init() {
   await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS edge       DOUBLE PRECISION NOT NULL DEFAULT 0.10;`);
   await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_win  INTEGER          NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_loss INTEGER          NOT NULL DEFAULT 0;`);
+
+  // Leaderboard snapshot, rebuilt from `players` on an interval by the API.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS leaderboard (
+      board      TEXT    NOT NULL,
+      rank       INTEGER NOT NULL,
+      user_id    BIGINT  NOT NULL,
+      value      BIGINT  NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (board, rank)
+    );
+  `);
 
   console.log("[db] tables ready");
 }
@@ -192,21 +204,18 @@ async function addWagered(userId, amount) {
 
 /* ---------------- Leaderboards ---------------- */
 
-// Global top-N boards. Each board is an array of { userId, value }, descending.
+// Compute the three boards live from `players`. Each is [{ userId, value }] desc.
 //   value   = summed inventory worth (sum of each item's Value)
 //   wagered = all-time wagered
 //   tokens  = current token balance
-async function leaderboard(limit) {
-  const n = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
-
+async function computeBoards(n) {
   const tokensQ = pool.query(
     "SELECT user_id, tokens AS value FROM players ORDER BY tokens DESC LIMIT $1", [n]);
 
   const wageredQ = pool.query(
     "SELECT user_id, wagered AS value FROM players ORDER BY wagered DESC LIMIT $1", [n]);
 
-  // Inventory items are stored as { Id, Name, Value }; fall back to lowercase
-  // just in case an older row used `value`.
+  // Inventory items are stored as { Id, Name, Value }; lowercase fallback for legacy rows.
   const valueQ = pool.query(
     `SELECT user_id,
             COALESCE((
@@ -220,6 +229,43 @@ async function leaderboard(limit) {
   const [tokens, wagered, value] = await Promise.all([tokensQ, wageredQ, valueQ]);
   const map = (r) => r.rows.map((row) => ({ userId: Number(row.user_id), value: Number(row.value) }));
   return { value: map(value), wagered: map(wagered), tokens: map(tokens) };
+}
+
+// Recompute and replace the `leaderboard` snapshot table in one transaction
+// (readers keep seeing the previous snapshot until commit). Called on an
+// interval from the API. STORE_TOP rows kept per board.
+const STORE_TOP = 100;
+async function refreshLeaderboard() {
+  const boards = await computeBoards(STORE_TOP);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("DELETE FROM leaderboard");
+    for (const board of Object.keys(boards)) {
+      const list = boards[board];
+      for (let i = 0; i < list.length; i++) {
+        await client.query(
+          "INSERT INTO leaderboard (board, rank, user_id, value, updated_at) VALUES ($1,$2,$3,$4, now())",
+          [board, i + 1, list[i].userId, list[i].value]
+        );
+      }
+    }
+    await client.query("COMMIT");
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
+  return boards;
+}
+
+// Read the snapshot table. ?limit= (default 10, max 100) trims each board.
+async function leaderboard(limit) {
+  const n = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
+  const { rows } = await pool.query(
+    "SELECT board, user_id, value FROM leaderboard WHERE rank <= $1 ORDER BY board, rank", [n]);
+  const out = { value: [], wagered: [], tokens: [] };
+  for (const r of rows) {
+    if (out[r.board]) out[r.board].push({ userId: Number(r.user_id), value: Number(r.value) });
+  }
+  return out;
 }
 
 /* ---------------- Battles ---------------- */
@@ -399,7 +445,8 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 }
 
 module.exports = {
-  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered, leaderboard,
+  init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered,
+  computeBoards, refreshLeaderboard, leaderboard,
   saveBattle, getBattle, recentBattles, playerBattles,
   getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl, pool,
 };
