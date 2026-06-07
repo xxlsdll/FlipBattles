@@ -2,9 +2,10 @@
  * db.js
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, all-time wagered, leaderboards (dedicated snapshot table), battle
- * logging/history, and the house bot (tokens/inventory + a server-controlled
- * edge / forced-outcome queue). Connects using DATABASE_URL.
+ * rewards, all-time wagered, leaderboards (dedicated snapshot table, refreshed
+ * on-write with a debounce + a periodic fallback), battle logging/history, and
+ * the house bot (tokens/inventory + a server-controlled edge / forced-outcome
+ * queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -57,7 +58,7 @@ async function init() {
   await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_win  INTEGER          NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE bots ADD COLUMN IF NOT EXISTS force_loss INTEGER          NOT NULL DEFAULT 0;`);
 
-  // Leaderboard snapshot, rebuilt from `players` on an interval by the API.
+  // Leaderboard snapshot, rebuilt from `players` on write (debounced) + on an interval.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leaderboard (
       board      TEXT    NOT NULL,
@@ -99,6 +100,7 @@ async function setPlayer(userId, tokens, inventory, wagered) {
      RETURNING tokens, inventory, wagered`,
     [userId, tokParam, invParam, wagParam]
   );
+  markLeaderboardDirty();
   return { tokens: Number(rows[0].tokens), inventory: rows[0].inventory, wagered: Number(rows[0].wagered) };
 }
 
@@ -122,6 +124,7 @@ async function addTokens(userId, delta, allowNegative = true) {
     const upd = await client.query(
       "UPDATE players SET tokens = $2, updated_at = now() WHERE user_id = $1 RETURNING tokens", [userId, next]);
     await client.query("COMMIT");
+    markLeaderboardDirty();
     return { ok: true, tokens: Number(upd.rows[0].tokens) };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
@@ -146,6 +149,7 @@ async function purchase(userId, price, item) {
       [userId, price, JSON.stringify(item)]
     );
     await client.query("COMMIT");
+    markLeaderboardDirty();
     return { ok: true, tokens: Number(upd.rows[0].tokens), inventory: upd.rows[0].inventory };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
@@ -162,6 +166,7 @@ async function grantItems(userId, items) {
      RETURNING inventory`,
     [userId, JSON.stringify(list)]
   );
+  markLeaderboardDirty();
   return { ok: true, inventory: rows[0].inventory };
 }
 
@@ -184,6 +189,7 @@ async function claimDaily(userId, day, amount) {
       [userId, Math.trunc(amount), day]
     );
     await client.query("COMMIT");
+    markLeaderboardDirty();
     return { ok: true, tokens: Number(upd.rows[0].tokens) };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
@@ -199,6 +205,7 @@ async function addWagered(userId, amount) {
      RETURNING wagered`,
     [userId, delta]
   );
+  markLeaderboardDirty();
   return { ok: true, wagered: Number(rows[0].wagered) };
 }
 
@@ -232,8 +239,7 @@ async function computeBoards(n) {
 }
 
 // Recompute and replace the `leaderboard` snapshot table in one transaction
-// (readers keep seeing the previous snapshot until commit). Called on an
-// interval from the API. STORE_TOP rows kept per board.
+// (readers keep seeing the previous snapshot until commit). STORE_TOP per board.
 const STORE_TOP = 100;
 async function refreshLeaderboard() {
   const boards = await computeBoards(STORE_TOP);
@@ -254,6 +260,19 @@ async function refreshLeaderboard() {
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
   return boards;
+}
+
+// Debounced refresh: ranking-changing writes call this; the rebuild fires once
+// ~2s later, coalescing a burst of writes (e.g. many concurrent battles) into a
+// single rebuild. Keeps the snapshot near-real-time without thrashing the DB.
+let _lbDirtyTimer = null;
+function markLeaderboardDirty(delayMs = 2000) {
+  if (_lbDirtyTimer) return;
+  _lbDirtyTimer = setTimeout(() => {
+    _lbDirtyTimer = null;
+    refreshLeaderboard().catch((e) => console.error("[leaderboard] dirty refresh failed:", e.message));
+  }, delayMs);
+  if (typeof _lbDirtyTimer.unref === "function") _lbDirtyTimer.unref();
 }
 
 // Read the snapshot table. ?limit= (default 10, max 100) trims each board.
