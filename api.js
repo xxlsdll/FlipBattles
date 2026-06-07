@@ -48,7 +48,8 @@ const ITEM_DETAILS_URL = "https://www.rolimons.com/itemapi/itemdetails";
 const MIN_VALUE = 10_000;
 const MAX_VALUE = 40_000_000;
 
-const REFRESH_MS = 10 * 60 * 1000;   // re-scrape every 10 minutes
+const REFRESH_MS = 10 * 60 * 1000;          // re-scrape every 10 minutes
+const LEADERBOARD_REFRESH_MS = 60 * 1000;   // rebuild the leaderboard snapshot every 60s
 const CACHE_FILE = "limiteds_cache.json";
 const PORT = process.env.PORT || 8080;
 
@@ -305,9 +306,9 @@ app.get("/battles/:id", requireKey, wrap(async (req, res) => {
   res.json(b);
 }));
 
-// --- Leaderboard (global top-N) -- key required ---
+// --- Leaderboard (global top-N, served from the snapshot table) -- key required ---
 // { value, wagered, tokens } -- each an array of { userId, value }, desc.
-// value board = summed inventory worth; ?limit= (default 10, max 100).
+// ?limit= (default 10, max 100).
 app.get("/leaderboard", requireKey, wrap(async (req, res) => {
   res.json(await db.leaderboard(req.query.limit));
 }));
@@ -377,8 +378,16 @@ async function start() {
   setInterval(refreshOnce, REFRESH_MS);
 
   if (process.env.DATABASE_URL) {
-    try { await db.init(); }
-    catch (e) { console.error("[db] init failed -- player/battle routes will error until the DB is reachable:", e.message); }
+    try {
+      await db.init();
+      await db.refreshLeaderboard().catch((e) => console.error("[leaderboard] initial refresh failed:", e.message));
+      setInterval(
+        () => db.refreshLeaderboard().catch((e) => console.error("[leaderboard] refresh failed:", e.message)),
+        LEADERBOARD_REFRESH_MS
+      );
+    } catch (e) {
+      console.error("[db] init failed -- player/battle routes will error until the DB is reachable:", e.message);
+    }
   } else {
     console.warn("[db] No DATABASE_URL set -- player/battle routes will error.");
   }
