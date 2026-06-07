@@ -25,6 +25,11 @@
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
  *   GET  /battles/:id              -> full battle record                       (key)
  *   GET  /leaderboard              -> { value, wagered, tokens }  (top-N each)  (key)
+ *   GET  /codes                    -> { codes }  (active codes)                (key)
+ *   GET  /codes/:code              -> full code record                         (key)
+ *   PUT  /codes/:code              -> { ok, code }  (create/update; bot)        (key)
+ *   POST /codes/:code/redeem       -> { ok, tokens, reward } | { ok:false, reason }  (key)
+ *   POST /codes/:code/deactivate   -> { ok, code, active }                      (key)
  *   GET  /bots/:name               -> { name, tokens, inventory }              (key)
  *   GET  /bots/:name/inventory     -> { name, count, inventory }              (key)
  *   POST /bots/:name/add           -> { ok, tokens }  (atomic)                 (key)
@@ -311,6 +316,43 @@ app.get("/battles/:id", requireKey, wrap(async (req, res) => {
 // ?limit= (default 10, max 100).
 app.get("/leaderboard", requireKey, wrap(async (req, res) => {
   res.json(await db.leaderboard(req.query.limit));
+}));
+
+// --- Codes -- key required ---
+
+// Authoritative redeem. Body: { userId }. 200 even on ok:false so the Lua reads
+// the reason (invalid_code | inactive | expired | maxed | already_redeemed).
+app.post("/codes/:code/redeem", requireKey, wrap(async (req, res) => {
+  const userId = Number(req.body.userId);
+  if (!Number.isFinite(userId)) return res.status(400).json({ error: "invalid_user" });
+  res.json(await db.redeemCode(req.params.code, Math.trunc(userId)));
+}));
+
+app.get("/codes", requireKey, wrap(async (req, res) => {
+  res.json({ codes: await db.getActiveCodes() });
+}));
+
+app.get("/codes/:code", requireKey, wrap(async (req, res) => {
+  const c = await db.getCode(req.params.code);
+  if (!c) return res.status(404).json({ error: "not_found" });
+  res.json(c);
+}));
+
+// Create/update a code (Discord bot). Body: { tokens, maxUses?, expiresAt?, active? }
+// maxUses null = unlimited; expiresAt null = never (ISO 8601 string otherwise).
+app.put("/codes/:code", requireKey, wrap(async (req, res) => {
+  const { tokens, maxUses, expiresAt, active } = req.body;
+  if (tokens != null && (!Number.isFinite(Number(tokens)) || Number(tokens) < 0)) {
+    return res.status(400).json({ error: "invalid_tokens" });
+  }
+  if (maxUses != null && (!Number.isFinite(Number(maxUses)) || Number(maxUses) < 0)) {
+    return res.status(400).json({ error: "invalid_max_uses" });
+  }
+  res.json(await db.upsertCode(req.params.code, { tokens, maxUses, expiresAt, active }));
+}));
+
+app.post("/codes/:code/deactivate", requireKey, wrap(async (req, res) => {
+  res.json(await db.setCodeActive(req.params.code, false));
 }));
 
 // --- Bots (the house, keyed by name) -- key required ---
