@@ -17,6 +17,7 @@
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
  *   POST /players/:id/add          -> { ok, tokens } | { ok:false, reason, tokens }   (key)
  *   POST /players/:id/give         -> { ok, tokens }  (grant + instant push)    (key)
+ *   POST /players/:id/set          -> { ok, tokens }  (absolute set + instant push)  (key)
  *   POST /players/:id/purchase     -> { ok, tokens, inventory } | { ok:false, ... }   (key)
  *   POST /players/:id/grant        -> { ok, inventory }  (atomic append; offline-safe) (key)
  *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
@@ -283,13 +284,23 @@ app.post("/players/:id/add", requireKey, wrap(async (req, res) => {
 
 // Grant (or remove, if negative) tokens and instantly push the new balance to
 // live servers via Open Cloud MessagingService. Body: { amount }.
-// This is the endpoint your Discord bot / admin tools should call.
+// This is the endpoint your Discord bot / admin tools should call to ADD tokens.
 app.post("/players/:id/give", requireKey, wrap(async (req, res) => {
   const amount = Number(req.body.amount);
   if (!Number.isFinite(amount)) return res.status(400).json({ error: "invalid_amount" });
   const result = await db.addTokens(req.params.id, Math.trunc(amount), req.body.allowNegative !== false);
   if (result.ok) await publishTokens(req.params.id, result.tokens);
   res.json(result);
+}));
+
+// Set a player's tokens to an absolute value and instantly push it. Body: { tokens }.
+// Use this (not a hand-edit of the column) when an admin/Discord tool SETS a balance.
+app.post("/players/:id/set", requireKey, wrap(async (req, res) => {
+  const tokens = Number(req.body.tokens);
+  if (!Number.isFinite(tokens)) return res.status(400).json({ error: "invalid_tokens" });
+  const p = await db.setPlayer(req.params.id, Math.trunc(tokens));  // inventory/wagered untouched
+  await publishTokens(req.params.id, p.tokens);
+  res.json({ ok: true, tokens: p.tokens });
 }));
 
 // Atomic purchase: deduct price AND append item in one transaction.
@@ -465,7 +476,7 @@ app.use((err, req, res, next) => { console.error("[server] error:", err); res.st
 // ---------------------------------------------------------------------------
 async function start() {
   if (!API_KEY) console.warn("[auth] No API_KEY set -- protected routes will return 500 until it's set.");
-  if (!OPEN_CLOUD_KEY || !UNIVERSE_ID) console.warn("[push] OPEN_CLOUD_KEY / UNIVERSE_ID not set -- /give will skip the instant push.");
+  if (!OPEN_CLOUD_KEY || !UNIVERSE_ID) console.warn("[push] OPEN_CLOUD_KEY / UNIVERSE_ID not set -- /give and /set will skip the instant push.");
 
   loadCache();
   await refreshOnce();
