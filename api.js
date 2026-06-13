@@ -23,6 +23,7 @@
  *   POST /players/:id/daily        -> { ok, tokens } | { ok:false, already_claimed }   (key)
  *   POST /players/:id/wager        -> { ok, wagered }  (atomic increment)       (key)
  *   POST /players/:id/game         -> { ok, stats }  (record a resolved game)   (key)
+ *   POST /players/:id/rank         -> { ok, rank }  (persist rank string)       (key)
  *   GET  /players/:id/stats        -> { user_id, stats }                        (key)
  *   GET  /players/:id/battles      -> { user_id, battles }                     (key)
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
@@ -341,12 +342,19 @@ app.post("/players/:id/wager", requireKey, wrap(async (req, res) => {
 }));
 
 // Record one resolved game (stats). Body: { bet, betType: "tokens"|"value", opponentValue, won }.
-// Bumps tokens/value bet + profit + games played/won/lost (and wagered) atomically.
+// Bumps tokens/value bet + profit + games played/won/lost (and wagered, top_wager) atomically.
 app.post("/players/:id/game", requireKey, wrap(async (req, res) => {
   const { bet, betType, opponentValue, won } = req.body;
   if (!Number.isFinite(Number(bet)) || Number(bet) < 0) return res.status(400).json({ error: "invalid_bet" });
   if (betType !== "tokens" && betType !== "value") return res.status(400).json({ error: "invalid_bet_type" });
   res.json(await db.recordGame(req.params.id, { bet, betType, opponentValue, won: won === true }));
+}));
+
+// Persist a player's rank string. Body: { rank }  (string, or null/omitted to clear).
+app.post("/players/:id/rank", requireKey, wrap(async (req, res) => {
+  const { rank } = req.body;
+  if (rank != null && typeof rank !== "string") return res.status(400).json({ error: "invalid_rank" });
+  res.json(await db.setRank(req.params.id, rank ?? null));
 }));
 
 app.get("/players/:id/stats", requireKey, wrap(async (req, res) => {
