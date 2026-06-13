@@ -2,11 +2,9 @@
  * api.js  (Node.js)
  * -----------------
  * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON,
- * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres,
- * plus a composite "P1 vs P2" headshot banner for the whale-battle Discord embed.
+ * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres.
  *
  * Requires Node.js 18+.  Run: npm install && node api.js
- *   (banner dependency: @napi-rs/canvas)
  *
  * Routes:
  *   GET  /                         -> health/status                            (public)
@@ -14,7 +12,6 @@
  *   GET  /version                  -> { version, count, updated_at }            (public)
  *   GET  /limiteds.js              -> const Limiteds = {...}  (JS consumers)     (public)
  *   GET  /limiteds/:id             -> single item                               (public)
- *   GET  /vs                       -> PNG  (P1 vs P2 banner; ?u1=&c1=&u2=&c2=)   (public)
  *   GET  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   PUT  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
@@ -52,15 +49,6 @@ const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
 const db = require("./db");
-
-// Optional -- the /vs banner needs @napi-rs/canvas, but a missing module must
-// NOT crash the whole API. Install it with: npm install @napi-rs/canvas
-let createCanvas = null, loadImage = null, GlobalFonts = null;
-try {
-  ({ createCanvas, loadImage, GlobalFonts } = require("@napi-rs/canvas"));
-} catch (e) {
-  console.warn("[vs] @napi-rs/canvas not installed -- /vs banner disabled until you run `npm install @napi-rs/canvas`");
-}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -217,118 +205,6 @@ async function publishTokens(userId, tokens) {
   } catch (e) { console.error("[push] error:", e.message); return false; }
 }
 
-// --- VS banner (composite headshot image for the whale-battle embed) ---------
-// Ring color per coin side -- match these to your in-game coin emojis. Tweak freely.
-const COIN_COLORS = { bux: "#3ba55d", tix: "#e8862e" };
-const RING_DEFAULT = "#dfe2e6";
-function ringColor(coin) {
-  return COIN_COLORS[String(coin || "").toLowerCase()] || RING_DEFAULT;
-}
-
-// Railway's container has no system font, so canvas text won't render. Load one
-// at runtime (lazy + cached, non-fatal) so the "VS" actually draws.
-const FONT_URL = "https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter/Inter_900Black.ttf";
-let FONT = "sans-serif";
-async function ensureFont() {
-  if (FONT !== "sans-serif" || !GlobalFonts) return;
-  try {
-    const resp = await fetch(FONT_URL);
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    GlobalFonts.register(Buffer.from(await resp.arrayBuffer()), "VsFont");
-    FONT = "VsFont";
-    console.log("[vs] font registered");
-  } catch (e) { console.warn("[vs] font register failed -- VS text may not show:", e.message); }
-}
-
-// Fetch a user's headshot image (thumbnails API returns JSON w/ the real URL).
-async function fetchHeadshotImage(userId) {
-  try {
-    const metaUrl = `https://thumbnails.roproxy.com/v1/users/avatar-headshot?userIds=${userId}&size=420x420&format=Png&isCircular=false`;
-    const metaResp = await fetch(metaUrl);
-    if (!metaResp.ok) return null;
-    const meta = await metaResp.json();
-    const imageUrl = meta && meta.data && meta.data[0] && meta.data[0].imageUrl;
-    if (!imageUrl) return null;
-    const imgResp = await fetch(imageUrl);
-    if (!imgResp.ok) return null;
-    return await loadImage(Buffer.from(await imgResp.arrayBuffer()));
-  } catch (e) { console.error("[vs] headshot fetch:", e.message); return null; }
-}
-
-// Compose [P1] VS [P2] with coin-colored rings + glow. u2/c2 may be null (waiting).
-async function buildVsImage(u1, c1, u2, c2) {
-  const W = 820, H = 360, R = 132, cy = 180;
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext("2d");
-
-  const [img1, img2] = await Promise.all([
-    u1 ? fetchHeadshotImage(u1) : null,
-    u2 ? fetchHeadshotImage(u2) : null,
-  ]);
-
-  function drawPlayer(img, cx, coin) {
-    const color = ringColor(coin);
-
-    // soft outer glow
-    ctx.save();
-    ctx.shadowColor = color;
-    ctx.shadowBlur = 35;
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.lineWidth = 14;
-    ctx.strokeStyle = color;
-    ctx.stroke();
-    ctx.restore();
-
-    // headshot, clipped inside the ring
-    ctx.save();
-    ctx.beginPath();
-    ctx.arc(cx, cy, R - 8, 0, Math.PI * 2);
-    ctx.closePath();
-    ctx.clip();
-    if (img) {
-      ctx.drawImage(img, cx - R, cy - R, R * 2, R * 2);
-    } else {
-      ctx.fillStyle = "#2b2d31";
-      ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
-    }
-    ctx.restore();
-
-    // crisp ring on top
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.lineWidth = 12;
-    ctx.strokeStyle = color;
-    ctx.stroke();
-
-    if (!img) {
-      ctx.fillStyle = "#9aa0a6";
-      ctx.font = `900 120px ${FONT}`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText("?", cx, cy);
-    }
-  }
-
-  drawPlayer(img1, 215, c1);
-  drawPlayer(img2, W - 215, c2);
-
-  // VS in the middle
-  ctx.font = `900 104px ${FONT}`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.lineWidth = 14;
-  ctx.strokeStyle = "#0d0d0f";
-  ctx.strokeText("VS", W / 2, cy);
-  ctx.fillStyle = "#ff4757";
-  ctx.fillText("VS", W / 2, cy);
-
-  return await canvas.encode("png");
-}
-
-const _vsCache = new Map(); // "u1:c1:u2:c2" -> { buf, at }
-const VS_TTL_MS = 10 * 60 * 1000;
-
 // Async wrapper: a thrown error becomes next(err) -> error handler -> 500.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -365,30 +241,6 @@ app.get("/limiteds/:id", (req, res) => {
   if (!item) return res.status(404).json({ error: "not_found" });
   res.json(item);
 });
-
-// Public PNG banner for the whale embed. Discord fetches this directly (no key).
-// ?u1=&c1=&u2=&c2=   (u2/c2 optional -> "waiting" placeholder).
-app.get("/vs", wrap(async (req, res) => {
-  if (!createCanvas) return res.status(503).json({ error: "vs_unavailable" });
-  const u1 = Number(req.query.u1) > 0 ? Math.trunc(Number(req.query.u1)) : null;
-  const u2 = Number(req.query.u2) > 0 ? Math.trunc(Number(req.query.u2)) : null;
-  const c1 = String(req.query.c1 || "");
-  const c2 = String(req.query.c2 || "");
-  if (!u1 && !u2) return res.status(400).json({ error: "missing_users" });
-
-  const key = `${u1 || 0}:${c1}:${u2 || 0}:${c2}`;
-  const hit = _vsCache.get(key);
-  let buf;
-  if (hit && Date.now() - hit.at < VS_TTL_MS) {
-    buf = hit.buf;
-  } else {
-    await ensureFont();
-    buf = await buildVsImage(u1, c1, u2, c2);
-    _vsCache.set(key, { buf, at: Date.now() });
-  }
-  res.set("Cache-Control", "public, max-age=600");
-  res.type("png").send(buf);
-}));
 
 // --- Players (tokens + inventory) -- key required ---
 
@@ -637,7 +489,6 @@ async function start() {
   loadCache();
   await refreshOnce();
   setInterval(refreshOnce, REFRESH_MS);
-  ensureFont().catch(() => {});  // preload the VS font (non-fatal)
 
   if (process.env.DATABASE_URL) {
     try {
