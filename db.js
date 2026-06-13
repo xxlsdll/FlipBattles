@@ -2,11 +2,12 @@
  * db.js
  * -----
  * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, all-time wagered, per-player game stats (bet / profit / games), 
- * leaderboards (dedicated snapshot table, refreshed on-write with a debounce +
- * a periodic fallback), redeem codes (atomic, with max-uses / expiry /
- * once-per-player), battle logging/history, and the house bot (tokens/inventory
- * + a server-controlled edge / forced-outcome queue). Connects using DATABASE_URL.
+ * rewards, all-time wagered, per-player game stats (bet / profit / games /
+ * top single-flip wager / rank), leaderboards (dedicated snapshot table,
+ * refreshed on-write with a debounce + a periodic fallback), redeem codes
+ * (atomic, with max-uses / expiry / once-per-player), battle logging/history,
+ * and the house bot (tokens/inventory + a server-controlled edge /
+ * forced-outcome queue). Connects using DATABASE_URL.
  */
 
 const { Pool } = require("pg");
@@ -37,6 +38,9 @@ async function init() {
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_played  INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_won     INTEGER NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS games_lost    INTEGER NOT NULL DEFAULT 0;`);
+  // Rank: biggest single-coinflip wager + the resulting rank string.
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS top_wager BIGINT NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS rank TEXT;`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
@@ -252,12 +256,14 @@ function mapStats(r) {
     gamesPlayed: Number(r.games_played || 0),
     gamesWon: Number(r.games_won || 0),
     gamesLost: Number(r.games_lost || 0),
+    topWager: Number(r.top_wager || 0),
+    rank: r.rank ?? null,
   };
 }
 
 // Record one resolved game for a player. Profit is net, bucketed by stake type:
 // win => +opponentValue, loss => -bet, into tokens_* or value_* by betType.
-// Also bumps `wagered` (= bet) so the wagered leaderboard stays consistent.
+// Also bumps `wagered` (= bet) and `top_wager` (= max single-flip wager).
 async function recordGame(userId, { bet, betType, opponentValue, won }) {
   bet = Math.max(0, Math.trunc(Number(bet) || 0));
   const opp = Math.max(0, Math.trunc(Number(opponentValue) || 0));
@@ -268,8 +274,8 @@ async function recordGame(userId, { bet, betType, opponentValue, won }) {
   const w = won ? 1 : 0,            l = won ? 0 : 1;
 
   const { rows } = await pool.query(
-    `INSERT INTO players (user_id, wagered, tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost)
-       VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8)
+    `INSERT INTO players (user_id, wagered, tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost, top_wager)
+       VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $2)
      ON CONFLICT (user_id) DO UPDATE SET
        wagered       = players.wagered       + $2,
        tokens_bet    = players.tokens_bet    + $3,
@@ -279,8 +285,9 @@ async function recordGame(userId, { bet, betType, opponentValue, won }) {
        games_played  = players.games_played  + 1,
        games_won     = players.games_won     + $7,
        games_lost    = players.games_lost    + $8,
+       top_wager     = GREATEST(players.top_wager, $2),
        updated_at = now()
-     RETURNING tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost`,
+     RETURNING tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost, top_wager`,
     [userId, bet, tb, vb, tp, vp, w, l]
   );
   markLeaderboardDirty();
@@ -289,9 +296,20 @@ async function recordGame(userId, { bet, betType, opponentValue, won }) {
 
 async function getStats(userId) {
   const { rows } = await pool.query(
-    `SELECT tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost
+    `SELECT tokens_bet, value_bet, tokens_profit, value_profit, games_played, games_won, games_lost, top_wager, rank
        FROM players WHERE user_id = $1`, [userId]);
   return mapStats(rows.length ? rows[0] : {});
+}
+
+// Persist a player's current rank string (e.g. "GOD"), or null for no rank.
+async function setRank(userId, rank) {
+  const { rows } = await pool.query(
+    `INSERT INTO players (user_id, rank) VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET rank = $2, updated_at = now()
+     RETURNING rank`,
+    [userId, rank || null]
+  );
+  return { ok: true, rank: rows[0].rank };
 }
 
 /* ---------------- Leaderboards ---------------- */
@@ -651,7 +669,7 @@ async function setBotControl(name, { edge, force_win, force_loss }) {
 
 module.exports = {
   init, getPlayer, setPlayer, getInventory, addTokens, purchase, grantItems, claimDaily, addWagered,
-  recordGame, getStats,
+  recordGame, getStats, setRank,
   computeBoards, refreshLeaderboard, leaderboard,
   redeemCode, getActiveCodes, getCode, upsertCode, setCodeActive,
   saveBattle, getBattle, recentBattles, playerBattles,
