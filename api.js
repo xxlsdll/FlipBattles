@@ -2,9 +2,11 @@
  * api.js  (Node.js)
  * -----------------
  * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON,
- * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres.
+ * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres,
+ * plus a composite "P1 vs P2" headshot banner for the whale-battle Discord embed.
  *
  * Requires Node.js 18+.  Run: npm install && node api.js
+ *   (new dependency: @napi-rs/canvas  ->  npm install @napi-rs/canvas)
  *
  * Routes:
  *   GET  /                         -> health/status                            (public)
@@ -12,6 +14,7 @@
  *   GET  /version                  -> { version, count, updated_at }            (public)
  *   GET  /limiteds.js              -> const Limiteds = {...}  (JS consumers)     (public)
  *   GET  /limiteds/:id             -> single item                               (public)
+ *   GET  /vs                       -> PNG  (P1 vs P2 headshot banner; ?u1=&u2=)  (public)
  *   GET  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   PUT  /players/:id              -> { user_id, tokens, inventory, wagered }   (key)
  *   GET  /players/:id/inventory    -> { user_id, count, inventory }            (key)
@@ -48,6 +51,7 @@
 const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
+const { createCanvas, loadImage } = require("@napi-rs/canvas");
 const db = require("./db");
 
 // ---------------------------------------------------------------------------
@@ -205,6 +209,79 @@ async function publishTokens(userId, tokens) {
   } catch (e) { console.error("[push] error:", e.message); return false; }
 }
 
+// --- VS banner (composite headshot image for the whale-battle embed) ---------
+// Fetch a user's headshot image (thumbnails API returns JSON w/ the real URL).
+async function fetchHeadshotImage(userId) {
+  try {
+    const metaUrl = `https://thumbnails.roproxy.com/v1/users/avatar-headshot?userIds=${userId}&size=420x420&format=Png&isCircular=false`;
+    const metaResp = await fetch(metaUrl);
+    if (!metaResp.ok) return null;
+    const meta = await metaResp.json();
+    const imageUrl = meta && meta.data && meta.data[0] && meta.data[0].imageUrl;
+    if (!imageUrl) return null;
+    const imgResp = await fetch(imageUrl);
+    if (!imgResp.ok) return null;
+    return await loadImage(Buffer.from(await imgResp.arrayBuffer()));
+  } catch (e) { console.error("[vs] headshot fetch:", e.message); return null; }
+}
+
+// Compose [P1] VS [P2] as a transparent PNG. u2 may be null (waiting state).
+async function buildVsImage(u1, u2) {
+  const W = 640, H = 300, R = 110;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext("2d");
+
+  const [img1, img2] = await Promise.all([
+    u1 ? fetchHeadshotImage(u1) : null,
+    u2 ? fetchHeadshotImage(u2) : null,
+  ]);
+
+  function drawAvatar(img, cx) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, H / 2, R, 0, Math.PI * 2);
+    ctx.closePath();
+    ctx.clip();
+    if (img) {
+      ctx.drawImage(img, cx - R, H / 2 - R, R * 2, R * 2);
+    } else {
+      ctx.fillStyle = "#3a3d44";
+      ctx.fillRect(cx - R, H / 2 - R, R * 2, R * 2);
+    }
+    ctx.restore();
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(cx, H / 2, R, 0, Math.PI * 2);
+    ctx.stroke();
+    if (!img) {
+      ctx.fillStyle = "#9aa0a6";
+      ctx.font = "bold 96px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("?", cx, H / 2);
+    }
+  }
+
+  drawAvatar(img1, 150);
+  drawAvatar(img2, W - 150);
+
+  // VS in the middle
+  ctx.font = "bold 88px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineWidth = 10;
+  ctx.strokeStyle = "#000000";
+  ctx.strokeText("VS", W / 2, H / 2);
+  ctx.fillStyle = "#ff3b3b";
+  ctx.fillText("VS", W / 2, H / 2);
+
+  return await canvas.encode("png");
+}
+
+const _vsCache = new Map(); // "u1:u2" -> { buf, at }
+const VS_TTL_MS = 10 * 60 * 1000;
+
 // Async wrapper: a thrown error becomes next(err) -> error handler -> 500.
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -241,6 +318,26 @@ app.get("/limiteds/:id", (req, res) => {
   if (!item) return res.status(404).json({ error: "not_found" });
   res.json(item);
 });
+
+// Public PNG banner for the whale embed. Discord fetches this directly (no key).
+// ?u1=<userId>&u2=<userId>  (u2 optional -> "waiting" placeholder).
+app.get("/vs", wrap(async (req, res) => {
+  const u1 = Number(req.query.u1) > 0 ? Math.trunc(Number(req.query.u1)) : null;
+  const u2 = Number(req.query.u2) > 0 ? Math.trunc(Number(req.query.u2)) : null;
+  if (!u1 && !u2) return res.status(400).json({ error: "missing_users" });
+
+  const key = `${u1 || 0}:${u2 || 0}`;
+  const hit = _vsCache.get(key);
+  let buf;
+  if (hit && Date.now() - hit.at < VS_TTL_MS) {
+    buf = hit.buf;
+  } else {
+    buf = await buildVsImage(u1, u2);
+    _vsCache.set(key, { buf, at: Date.now() });
+  }
+  res.set("Cache-Control", "public, max-age=600");
+  res.type("png").send(buf);
+}));
 
 // --- Players (tokens + inventory) -- key required ---
 
