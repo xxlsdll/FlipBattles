@@ -1,13 +1,15 @@
 /**
- * db.js
- * -----
- * Postgres data layer: player tokens + inventory, atomic add/purchase, daily
- * rewards, all-time wagered, per-player game stats (bet / profit / games /
- * top single-flip wager / rank), leaderboards (dedicated snapshot table,
- * refreshed on-write with a debounce + a periodic fallback), redeem codes
- * (atomic, with max-uses / expiry / once-per-player), battle logging/history,
- * and the house bot (tokens/inventory + a server-controlled edge /
- * forced-outcome queue). Connects using DATABASE_URL.
+ * db.js  (count-based inventory)
+ * ------------------------------
+ * Postgres data layer. Inventories are stored as count-based STACKS
+ * ({Id, Name, Value, Count}); copies of the same Id merge into one stack.
+ * Changes vs the flat version:
+ *   - players.inventory_value maintained column (leaderboard reads it, no unnest)
+ *   - grantItems / purchase MERGE by Id (no blind append of duplicate stacks)
+ *   - battle list endpoints return a projection (no per-item arrays)
+ *   - commitBotStake decrements stack Counts
+ * The normalize helpers are inlined here and exported (migrate-stacks.js uses them),
+ * and mirror the Roblox ItemStacks module byte-for-byte in behaviour.
  */
 
 const { Pool } = require("pg");
@@ -16,6 +18,58 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   // ssl: { rejectUnauthorized: false }, // only if using the PUBLIC proxy URL
 });
+
+/* ---------------- Stack helpers (shared contract) ---------------- */
+
+function normCount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.floor(n);
+}
+
+// Accepts a flat array (legacy, no Count) OR stacks; returns merged stacks
+// (one per Id). Idempotent -- safe to run repeatedly and to mix formats.
+function normalizeInventory(raw) {
+  if (!Array.isArray(raw)) return [];
+  const order = [];
+  const byId = new Map();
+  for (const entry of raw) {
+    if (entry && typeof entry === "object" && entry.Id != null) {
+      const id = String(entry.Id);
+      let stack = byId.get(id);
+      if (!stack) {
+        stack = { Id: id, Name: entry.Name, Value: entry.Value, Count: 0 };
+        byId.set(id, stack);
+        order.push(stack);
+      }
+      if (entry.Name != null) stack.Name = entry.Name;
+      if (entry.Value != null) stack.Value = entry.Value;
+      stack.Count += normCount(entry.Count);
+    }
+  }
+  return order.filter((s) => s.Count > 0);
+}
+
+// Merge `items` (flat entries or stacks) into an already-normalized `base`.
+function mergeStacks(base, items) {
+  return normalizeInventory((Array.isArray(base) ? base : []).concat(Array.isArray(items) ? items : []));
+}
+
+function inventoryValue(stacks) {
+  let v = 0;
+  for (const s of Array.isArray(stacks) ? stacks : []) {
+    v += (Number(s.Value) || 0) * (Number(s.Count) || 1);
+  }
+  return Math.trunc(v);
+}
+
+function itemCount(stacks) {
+  let n = 0;
+  for (const s of Array.isArray(stacks) ? stacks : []) {
+    n += (Number(s.Count) || 1);
+  }
+  return n;
+}
 
 async function init() {
   await pool.query(`
@@ -28,6 +82,7 @@ async function init() {
   `);
   // Safe to run on an existing tokens-only table:
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS inventory JSONB NOT NULL DEFAULT '[]'::jsonb;`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS inventory_value BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_daily_claim BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wagered BIGINT NOT NULL DEFAULT 0;`);
   // Per-player game stats:
@@ -41,6 +96,7 @@ async function init() {
   // Rank: biggest single-coinflip wager + the resulting rank string.
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS top_wager BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS rank TEXT;`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_players_inventory_value ON players(inventory_value DESC);`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
@@ -114,35 +170,38 @@ async function init() {
 async function getPlayer(userId) {
   const { rows } = await pool.query("SELECT tokens, inventory, wagered FROM players WHERE user_id = $1", [userId]);
   return rows.length
-    ? { tokens: Number(rows[0].tokens), inventory: rows[0].inventory, wagered: Number(rows[0].wagered) }
+    ? { tokens: Number(rows[0].tokens), inventory: normalizeInventory(rows[0].inventory), wagered: Number(rows[0].wagered) }
     : null;
 }
 
-// Partial update: only the fields you pass are changed. Omitted fields keep
-// their existing value (so a token-only save can't wipe the inventory).
-// wagered is monotonic -- GREATEST guards against an absolute save lowering it.
+// Partial update: only the fields you pass are changed. When inventory is
+// provided it is normalized to stacks and inventory_value is recomputed in the
+// same write. wagered is monotonic (GREATEST guards against lowering it).
 async function setPlayer(userId, tokens, inventory, wagered) {
   const tokParam = tokens === undefined || tokens === null ? null : Math.trunc(tokens);
-  const invParam = inventory === undefined || inventory === null ? null : JSON.stringify(inventory);
+  const stacks = inventory === undefined || inventory === null ? null : normalizeInventory(inventory);
+  const invParam = stacks === null ? null : JSON.stringify(stacks);
+  const valParam = stacks === null ? null : inventoryValue(stacks);
   const wagParam = wagered === undefined || wagered === null ? null : Math.trunc(wagered);
   const { rows } = await pool.query(
-    `INSERT INTO players (user_id, tokens, inventory, wagered)
-       VALUES ($1, COALESCE($2::bigint, 0), COALESCE($3::jsonb, '[]'::jsonb), COALESCE($4::bigint, 0))
+    `INSERT INTO players (user_id, tokens, inventory, inventory_value, wagered)
+       VALUES ($1, COALESCE($2::bigint, 0), COALESCE($3::jsonb, '[]'::jsonb), COALESCE($4::bigint, 0), COALESCE($5::bigint, 0))
      ON CONFLICT (user_id) DO UPDATE
-       SET tokens     = COALESCE($2::bigint, players.tokens),
-           inventory  = COALESCE($3::jsonb, players.inventory),
-           wagered    = GREATEST(players.wagered, COALESCE($4::bigint, players.wagered)),
+       SET tokens          = COALESCE($2::bigint, players.tokens),
+           inventory       = COALESCE($3::jsonb, players.inventory),
+           inventory_value = COALESCE($4::bigint, players.inventory_value),
+           wagered         = GREATEST(players.wagered, COALESCE($5::bigint, players.wagered)),
            updated_at = now()
      RETURNING tokens, inventory, wagered`,
-    [userId, tokParam, invParam, wagParam]
+    [userId, tokParam, invParam, valParam, wagParam]
   );
   markLeaderboardDirty();
-  return { tokens: Number(rows[0].tokens), inventory: rows[0].inventory, wagered: Number(rows[0].wagered) };
+  return { tokens: Number(rows[0].tokens), inventory: normalizeInventory(rows[0].inventory), wagered: Number(rows[0].wagered) };
 }
 
 async function getInventory(userId) {
   const { rows } = await pool.query("SELECT inventory FROM players WHERE user_id = $1", [userId]);
-  return rows.length ? rows[0].inventory : [];
+  return rows.length ? normalizeInventory(rows[0].inventory) : [];
 }
 
 async function addTokens(userId, delta, allowNegative = true) {
@@ -166,49 +225,55 @@ async function addTokens(userId, delta, allowNegative = true) {
   finally { client.release(); }
 }
 
-// Atomic purchase: deduct price AND append item in one transaction.
+// Atomic purchase: deduct price AND merge the item stack in one transaction.
 async function purchase(userId, price, item) {
   price = Math.trunc(price);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query("INSERT INTO players (user_id, tokens) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING", [userId]);
-    const { rows } = await client.query("SELECT tokens FROM players WHERE user_id = $1 FOR UPDATE", [userId]);
+    const { rows } = await client.query("SELECT tokens, inventory FROM players WHERE user_id = $1 FOR UPDATE", [userId]);
     const current = Number(rows[0].tokens);
     if (current < price) {
       await client.query("ROLLBACK");
       return { ok: false, reason: "insufficient", tokens: current };
     }
+    const merged = mergeStacks(normalizeInventory(rows[0].inventory), [item]);
+    const value = inventoryValue(merged);
     const upd = await client.query(
-      `UPDATE players SET tokens = tokens - $2, inventory = inventory || $3::jsonb, updated_at = now()
+      `UPDATE players SET tokens = tokens - $2, inventory = $3::jsonb, inventory_value = $4, updated_at = now()
        WHERE user_id = $1 RETURNING tokens, inventory`,
-      [userId, price, JSON.stringify(item)]
+      [userId, price, JSON.stringify(merged), value]
     );
     await client.query("COMMIT");
     markLeaderboardDirty();
-    return { ok: true, tokens: Number(upd.rows[0].tokens), inventory: upd.rows[0].inventory };
+    return { ok: true, tokens: Number(upd.rows[0].tokens), inventory: normalizeInventory(upd.rows[0].inventory) };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
 }
 
-// Atomically append item(s) to a player's inventory. Works whether or not the
-// player is online (no loaded profile needed) -- used for offline winners and
-// offline refunds. `items` is an ARRAY of item objects.
+// Atomically merge item stack(s) into a player's inventory (online or offline).
 async function grantItems(userId, items) {
-  const list = Array.isArray(items) ? items : [];
-  const { rows } = await pool.query(
-    `INSERT INTO players (user_id, tokens, inventory) VALUES ($1, 0, $2::jsonb)
-     ON CONFLICT (user_id) DO UPDATE SET inventory = players.inventory || $2::jsonb, updated_at = now()
-     RETURNING inventory`,
-    [userId, JSON.stringify(list)]
-  );
-  markLeaderboardDirty();
-  return { ok: true, inventory: rows[0].inventory };
+  const incoming = normalizeInventory(Array.isArray(items) ? items : []);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO players (user_id, tokens) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING", [userId]);
+    const { rows } = await client.query("SELECT inventory FROM players WHERE user_id = $1 FOR UPDATE", [userId]);
+    const merged = mergeStacks(normalizeInventory(rows[0].inventory), incoming);
+    const value = inventoryValue(merged);
+    const upd = await client.query(
+      "UPDATE players SET inventory = $2::jsonb, inventory_value = $3, updated_at = now() WHERE user_id = $1 RETURNING inventory",
+      [userId, JSON.stringify(merged), value]
+    );
+    await client.query("COMMIT");
+    markLeaderboardDirty();
+    return { ok: true, inventory: normalizeInventory(upd.rows[0].inventory) };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
 }
 
-// Atomic daily reward: grant tokens AND stamp the claim day in one transaction,
-// so a crash can't leave the tokens granted but the claim un-recorded (which
-// would allow a double-claim). `day` is a UTC day index, e.g. floor(now/86400).
+// Atomic daily reward: grant tokens AND stamp the claim day in one transaction.
 async function claimDaily(userId, day, amount) {
   const client = await pool.connect();
   try {
@@ -231,8 +296,7 @@ async function claimDaily(userId, day, amount) {
   finally { client.release(); }
 }
 
-// Atomic increment of all-time wagered. Used for offline participants when a
-// battle resolves; online players persist their absolute total via setPlayer.
+// Atomic increment of all-time wagered.
 async function addWagered(userId, amount) {
   const delta = Math.trunc(amount);
   const { rows } = await pool.query(
@@ -261,9 +325,6 @@ function mapStats(r) {
   };
 }
 
-// Record one resolved game for a player. Profit is net, bucketed by stake type:
-// win => +opponentValue, loss => -bet, into tokens_* or value_* by betType.
-// Also bumps `wagered` (= bet) and `top_wager` (= max single-flip wager).
 async function recordGame(userId, { bet, betType, opponentValue, won }) {
   bet = Math.max(0, Math.trunc(Number(bet) || 0));
   const opp = Math.max(0, Math.trunc(Number(opponentValue) || 0));
@@ -301,7 +362,6 @@ async function getStats(userId) {
   return mapStats(rows.length ? rows[0] : {});
 }
 
-// Persist a player's current rank string (e.g. "GOD"), or null for no rank.
 async function setRank(userId, rank) {
   const { rows } = await pool.query(
     `INSERT INTO players (user_id, rank) VALUES ($1, $2)
@@ -314,10 +374,7 @@ async function setRank(userId, rank) {
 
 /* ---------------- Leaderboards ---------------- */
 
-// Compute the three boards live from `players`. Each is [{ userId, value }] desc.
-//   value   = summed inventory worth (sum of each item's Value)
-//   wagered = all-time wagered
-//   tokens  = current token balance
+// value board now reads the maintained inventory_value column -- no jsonb unnest.
 async function computeBoards(n) {
   const tokensQ = pool.query(
     "SELECT user_id, tokens AS value FROM players ORDER BY tokens DESC LIMIT $1", [n]);
@@ -325,24 +382,14 @@ async function computeBoards(n) {
   const wageredQ = pool.query(
     "SELECT user_id, wagered AS value FROM players ORDER BY wagered DESC LIMIT $1", [n]);
 
-  // Inventory items are stored as { Id, Name, Value }; lowercase fallback for legacy rows.
   const valueQ = pool.query(
-    `SELECT user_id,
-            COALESCE((
-              SELECT SUM(COALESCE((elem->>'Value')::numeric, (elem->>'value')::numeric, 0))
-              FROM jsonb_array_elements(inventory) elem
-            ), 0) AS value
-       FROM players
-      ORDER BY value DESC
-      LIMIT $1`, [n]);
+    "SELECT user_id, inventory_value AS value FROM players ORDER BY inventory_value DESC LIMIT $1", [n]);
 
   const [tokens, wagered, value] = await Promise.all([tokensQ, wageredQ, valueQ]);
   const map = (r) => r.rows.map((row) => ({ userId: Number(row.user_id), value: Number(row.value) }));
   return { value: map(value), wagered: map(wagered), tokens: map(tokens) };
 }
 
-// Recompute and replace the `leaderboard` snapshot table in one transaction
-// (readers keep seeing the previous snapshot until commit). STORE_TOP per board.
 const STORE_TOP = 100;
 async function refreshLeaderboard() {
   const boards = await computeBoards(STORE_TOP);
@@ -365,9 +412,6 @@ async function refreshLeaderboard() {
   return boards;
 }
 
-// Debounced refresh: ranking-changing writes call this; the rebuild fires once
-// ~2s later, coalescing a burst of writes (e.g. many concurrent battles) into a
-// single rebuild. Keeps the snapshot near-real-time without thrashing the DB.
 let _lbDirtyTimer = null;
 function markLeaderboardDirty(delayMs = 2000) {
   if (_lbDirtyTimer) return;
@@ -378,7 +422,6 @@ function markLeaderboardDirty(delayMs = 2000) {
   if (typeof _lbDirtyTimer.unref === "function") _lbDirtyTimer.unref();
 }
 
-// Read the snapshot table. ?limit= (default 10, max 100) trims each board.
 async function leaderboard(limit) {
   const n = Math.min(Math.max(parseInt(limit) || 10, 1), 100);
   const { rows } = await pool.query(
@@ -392,9 +435,6 @@ async function leaderboard(limit) {
 
 /* ---------------- Codes ---------------- */
 
-// Authoritative redeem. Under a row lock on the code, validates active / expiry /
-// max-uses / not-already-redeemed, records the redemption, bumps the use count,
-// and grants tokens -- all in one transaction (crash-safe, no double-grant).
 async function redeemCode(code, userId) {
   code = String(code).toUpperCase();
   const client = await pool.connect();
@@ -433,7 +473,6 @@ async function redeemCode(code, userId) {
   finally { client.release(); }
 }
 
-// Active, non-expired, non-maxed codes (for listing / a future UI).
 async function getActiveCodes() {
   const { rows } = await pool.query(
     `SELECT code, tokens, max_uses, uses, expires_at
@@ -461,8 +500,6 @@ async function getCode(code) {
   };
 }
 
-// Create/replace a code (your Discord bot later). Sets tokens, max_uses
-// (null=unlimited), expires_at (null=never), active.
 async function upsertCode(code, { tokens, maxUses, expiresAt, active }) {
   code = String(code).toUpperCase();
   const { rows } = await pool.query(
@@ -493,7 +530,28 @@ async function setCodeActive(code, active) {
 
 /* ---------------- Battles ---------------- */
 
+// Trimmed list view: no per-item arrays, just an itemCount per player.
+function projectBattle(data) {
+  if (!data || typeof data !== "object") return data;
+  const players = Array.isArray(data.players)
+    ? data.players.map((p) => ({
+        userId: p.userId, name: p.name, role: p.role, coin: p.coin,
+        value: p.value, tokens: p.tokens, itemCount: itemCount(p.items),
+      }))
+    : [];
+  return {
+    id: data.id, battleNumber: data.battleNumber, status: data.status,
+    initiator: data.initiator, winner: data.winner, totalValue: data.totalValue,
+    players,
+  };
+}
+
 async function saveBattle(record) {
+  if (Array.isArray(record.players)) {
+    for (const p of record.players) {
+      if (Array.isArray(p.items)) p.items = normalizeInventory(p.items);
+    }
+  }
   const participants = Array.isArray(record.players)
     ? record.players.map((p) => p.userId).filter((v) => v != null)
     : [];
@@ -519,7 +577,7 @@ function clampLimit(limit) { return Math.min(Math.max(parseInt(limit) || 50, 1),
 
 async function recentBattles(limit) {
   const { rows } = await pool.query("SELECT data FROM battles ORDER BY created_at DESC LIMIT $1", [clampLimit(limit)]);
-  return rows.map((r) => r.data);
+  return rows.map((r) => projectBattle(r.data));
 }
 
 async function playerBattles(userId, limit) {
@@ -527,14 +585,14 @@ async function playerBattles(userId, limit) {
     "SELECT data FROM battles WHERE $1 = ANY(participants) ORDER BY created_at DESC LIMIT $2",
     [userId, clampLimit(limit)]
   );
-  return rows.map((r) => r.data);
+  return rows.map((r) => projectBattle(r.data));
 }
 
 /* ---------------- Bots (the house, keyed by name) ---------------- */
 
 async function getBot(name) {
   const { rows } = await pool.query("SELECT tokens, inventory FROM bots WHERE name = $1", [name]);
-  return rows.length ? { tokens: Number(rows[0].tokens), inventory: rows[0].inventory } : null;
+  return rows.length ? { tokens: Number(rows[0].tokens), inventory: normalizeInventory(rows[0].inventory) } : null;
 }
 
 async function addBotTokens(name, delta) {
@@ -547,20 +605,25 @@ async function addBotTokens(name, delta) {
   return { ok: true, tokens: Number(rows[0].tokens) };
 }
 
+// Merge item stack(s) into the bot's inventory under a row lock.
 async function grantBotItems(name, items) {
-  const list = Array.isArray(items) ? items : [];
-  const { rows } = await pool.query(
-    `INSERT INTO bots (name, inventory) VALUES ($1, $2::jsonb)
-     ON CONFLICT (name) DO UPDATE SET inventory = bots.inventory || $2::jsonb, updated_at = now()
-     RETURNING inventory`,
-    [name, JSON.stringify(list)]
-  );
-  return { ok: true, inventory: rows[0].inventory };
+  const incoming = normalizeInventory(Array.isArray(items) ? items : []);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
+    const { rows } = await client.query("SELECT inventory FROM bots WHERE name = $1 FOR UPDATE", [name]);
+    const merged = mergeStacks(normalizeInventory(rows[0].inventory), incoming);
+    const upd = await client.query(
+      "UPDATE bots SET inventory = $2::jsonb, updated_at = now() WHERE name = $1 RETURNING inventory",
+      [name, JSON.stringify(merged)]
+    );
+    await client.query("COMMIT");
+    return { ok: true, inventory: normalizeInventory(upd.rows[0].inventory) };
+  } catch (e) { await client.query("ROLLBACK"); throw e; }
+  finally { client.release(); }
 }
 
-// Atomic spend: deduct only if the bot can afford it. The row lock serializes
-// concurrent callers so the house can't be double-spent (e.g. many players
-// calling the bot into coinflips at once).
 async function spendBotTokens(name, amount) {
   amount = Math.trunc(amount);
   const client = await pool.connect();
@@ -583,35 +646,39 @@ async function spendBotTokens(name, amount) {
   finally { client.release(); }
 }
 
-// Atomically commit an item stake the caller already planned: remove the chosen
-// held items from the bot's inventory and deduct tokens for the minted items,
-// in one transaction. The caller (CoinflipService) decides held vs mint from the
-// live market + bot state; this revalidates under a row lock and returns
-// { ok:false, reason:"retry" } if a held item is gone (bot changed meanwhile),
-// or { ok:false, reason:"insufficient" } if tokens can't cover the mints.
-// Returns { ok, items:[...] } with the full staked list (held + minted).
+// Atomically commit a staked set. `held` are stacks (with Count) to remove from
+// the bot's inventory; `mint` are stacks to buy with tokens. Returns the full
+// staked stack list, or { ok:false, reason } on retry/insufficient.
 async function commitBotStake(name, heldToConsume, mintItems) {
-  const held = Array.isArray(heldToConsume) ? heldToConsume : [];
-  const mint = Array.isArray(mintItems) ? mintItems : [];
+  const held = normalizeInventory(Array.isArray(heldToConsume) ? heldToConsume : []);
+  const mint = normalizeInventory(Array.isArray(mintItems) ? mintItems : []);
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
     await client.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
     const { rows } = await client.query("SELECT tokens, inventory FROM bots WHERE name=$1 FOR UPDATE", [name]);
     let tokens = Number(rows[0].tokens);
-    let inv = Array.isArray(rows[0].inventory) ? rows[0].inventory.slice() : [];
+    let inv = normalizeInventory(rows[0].inventory);
 
-    // remove the chosen held items (one per entry, matched by Id)
+    // remove the chosen held stacks (decrement Count, matched by Id)
     const stakedHeld = [];
     for (const h of held) {
-      const idx = inv.findIndex((it) => String(it.Id) === String(h.Id));
-      if (idx === -1) { await client.query("ROLLBACK"); return { ok: false, reason: "retry" }; }
-      stakedHeld.push(inv[idx]);
-      inv.splice(idx, 1);
+      const id = String(h.Id);
+      const need = Number(h.Count) || 1;
+      const idx = inv.findIndex((it) => String(it.Id) === id);
+      if (idx === -1 || (Number(inv[idx].Count) || 1) < need) {
+        await client.query("ROLLBACK");
+        return { ok: false, reason: "retry" };
+      }
+      const st = inv[idx];
+      stakedHeld.push({ Id: st.Id, Name: st.Name, Value: st.Value, Count: need });
+      const left = (Number(st.Count) || 1) - need;
+      if (left <= 0) inv.splice(idx, 1);
+      else st.Count = left;
     }
 
-    // pay for the minted items
-    const mintCost = mint.reduce((s, it) => s + Math.trunc(Number(it.Value) || 0), 0);
+    // pay for the minted stacks
+    const mintCost = mint.reduce((s, it) => s + (Math.trunc(Number(it.Value)) || 0) * (Number(it.Count) || 1), 0);
     if (tokens < mintCost) { await client.query("ROLLBACK"); return { ok: false, reason: "insufficient", tokens }; }
     tokens -= mintCost;
 
@@ -619,16 +686,12 @@ async function commitBotStake(name, heldToConsume, mintItems) {
       [name, Math.trunc(tokens), JSON.stringify(inv)]);
     await client.query("COMMIT");
 
-    const items = stakedHeld.concat(mint.map((it) => ({ Id: it.Id, Name: it.Name, Value: Math.trunc(Number(it.Value) || 0) })));
+    const items = mergeStacks(stakedHeld, mint);
     return { ok: true, items };
   } catch (e) { await client.query("ROLLBACK"); throw e; }
   finally { client.release(); }
 }
 
-// Atomically decide + consume one outcome for the next bot game.
-// s: 0 = use edge, 1 = forced win, 2 = forced loss.  v = current edge.
-// Precedence: forced wins -> forced losses -> edge. FOR UPDATE means concurrent
-// games can't both consume the same queued win/loss.
 async function consumeBotOutcome(name) {
   const client = await pool.connect();
   try {
@@ -651,8 +714,6 @@ async function consumeBotOutcome(name) {
   finally { client.release(); }
 }
 
-// Control surface for your Discord bot. Pass any of edge / force_win / force_loss;
-// omitted fields are left unchanged.
 async function setBotControl(name, { edge, force_win, force_loss }) {
   await pool.query("INSERT INTO bots (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", [name]);
   const { rows } = await pool.query(
@@ -673,5 +734,6 @@ module.exports = {
   computeBoards, refreshLeaderboard, leaderboard,
   redeemCode, getActiveCodes, getCode, upsertCode, setCodeActive,
   saveBattle, getBattle, recentBattles, playerBattles,
-  getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl, pool,
+  getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl,
+  normalizeInventory, mergeStacks, inventoryValue, itemCount, pool,
 };
