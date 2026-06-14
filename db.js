@@ -5,6 +5,8 @@
  * ({Id, Name, Value, Count}); copies of the same Id merge into one stack.
  * Changes vs the flat version:
  *   - players.inventory_value maintained column (leaderboard reads it, no unnest)
+ *   - players.inventory_value is also kept correct by a DB trigger, so manual
+ *     edits to the inventory JSONB can never leave it stale
  *   - grantItems / purchase MERGE by Id (no blind append of duplicate stacks)
  *   - battle list endpoints return a projection (no per-item arrays)
  *   - commitBotStake decrements stack Counts
@@ -97,6 +99,44 @@ async function init() {
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS top_wager BIGINT NOT NULL DEFAULT 0;`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS rank TEXT;`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_players_inventory_value ON players(inventory_value DESC);`);
+
+  // Keep players.inventory_value correct on EVERY write to inventory -- including
+  // manual DB edits -- via a trigger (per-row jsonb sum, negligible cost).
+  // The leaderboard still just reads the column.
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION players_set_inventory_value()
+    RETURNS trigger AS $func$
+    BEGIN
+      NEW.inventory_value := (
+        CASE WHEN jsonb_typeof(NEW.inventory) = 'array' THEN COALESCE((
+          SELECT SUM(COALESCE((elem->>'Value')::numeric, 0) * COALESCE((elem->>'Count')::numeric, 1))
+          FROM jsonb_array_elements(NEW.inventory) elem
+        ), 0) ELSE 0 END
+      )::bigint;
+      RETURN NEW;
+    END;
+    $func$ LANGUAGE plpgsql;
+  `);
+  await pool.query(`DROP TRIGGER IF EXISTS trg_players_inventory_value ON players;`);
+  await pool.query(`
+    CREATE TRIGGER trg_players_inventory_value
+    BEFORE INSERT OR UPDATE OF inventory ON players
+    FOR EACH ROW EXECUTE FUNCTION players_set_inventory_value();
+  `);
+  // One-time self-heal for rows written before the trigger existed (no-op once correct).
+  await pool.query(`
+    WITH calc AS (
+      SELECT user_id,
+             CASE WHEN jsonb_typeof(inventory) = 'array' THEN COALESCE((
+               SELECT SUM(COALESCE((e->>'Value')::numeric, 0) * COALESCE((e->>'Count')::numeric, 1))
+               FROM jsonb_array_elements(inventory) e
+             ), 0) ELSE 0 END AS v
+      FROM players
+    )
+    UPDATE players p SET inventory_value = calc.v
+    FROM calc
+    WHERE p.user_id = calc.user_id AND p.inventory_value IS DISTINCT FROM calc.v;
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS battles (
