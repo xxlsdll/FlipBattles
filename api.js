@@ -212,7 +212,7 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 // App
 // ---------------------------------------------------------------------------
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 // --- Limiteds (public) ---
 app.get("/", (req, res) => {
