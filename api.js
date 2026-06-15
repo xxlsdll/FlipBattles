@@ -2,7 +2,7 @@
  * api.js  (Node.js)
  * -----------------
  * Scrapes Rolimon's classic limiteds on a schedule and serves them as JSON,
- * AND exposes player (tokens/inventory) + battle + bot routes backed by Postgres.
+ * AND exposes player (tokens/inventory) + battle + trade + bot routes backed by Postgres.
  *
  * Requires Node.js 18+.  Run: npm install && node api.js
  *
@@ -29,6 +29,10 @@
  *   GET  /battles                  -> { battles }  (recent; ?limit=)           (key)
  *   PUT  /battles/:id              -> { ok }  (log/upsert a battle)            (key)
  *   GET  /battles/:id              -> full battle record                       (key)
+ *   GET  /players/:id/trades       -> { user_id, trades }                      (key)
+ *   GET  /trades                   -> { trades }  (recent; ?limit=)            (key)
+ *   PUT  /trades/:id               -> { ok }  (log/upsert a trade)             (key)
+ *   GET  /trades/:id               -> full trade record                        (key)
  *   GET  /leaderboard              -> { value, wagered, tokens }  (top-N each)  (key)
  *   GET  /codes                    -> { codes }  (active codes)                (key)
  *   GET  /codes/:code              -> full code record                         (key)
@@ -379,6 +383,26 @@ app.get("/battles/:id", requireKey, wrap(async (req, res) => {
   const b = await db.getBattle(req.params.id);
   if (!b) return res.status(404).json({ error: "not_found" });
   res.json(b);
+}));
+
+// --- Trades (logs / receipts) -- key required ---
+app.get("/trades", requireKey, wrap(async (req, res) => {
+  res.json({ trades: await db.recentTrades(req.query.limit) });
+}));
+
+app.put("/trades/:id", requireKey, wrap(async (req, res) => {
+  const record = { ...req.body, id: req.params.id }; // URL is the source of truth for the id
+  res.json(await db.saveTrade(record));
+}));
+
+app.get("/trades/:id", requireKey, wrap(async (req, res) => {
+  const t = await db.getTrade(req.params.id);
+  if (!t) return res.status(404).json({ error: "not_found" });
+  res.json(t);
+}));
+
+app.get("/players/:id/trades", requireKey, wrap(async (req, res) => {
+  res.json({ user_id: req.params.id, trades: await db.playerTrades(req.params.id, req.query.limit) });
 }));
 
 // --- Leaderboard (global top-N, served from the snapshot table) -- key required ---
