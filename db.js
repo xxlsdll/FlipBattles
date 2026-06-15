@@ -155,6 +155,23 @@ async function init() {
   await pool.query(`CREATE INDEX IF NOT EXISTS battles_participants_idx ON battles USING GIN (participants);`);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS trades (
+      id            TEXT PRIMARY KEY,
+      status        TEXT NOT NULL,
+      sender        BIGINT,
+      receiver      BIGINT,
+      offer_value   BIGINT,
+      request_value BIGINT,
+      participants  BIGINT[] NOT NULL DEFAULT '{}',
+      data          JSONB NOT NULL,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS trades_created_idx ON trades (created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS trades_participants_idx ON trades USING GIN (participants);`);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS bots (
       name       TEXT PRIMARY KEY,
       tokens     BIGINT NOT NULL DEFAULT 0,
@@ -628,6 +645,62 @@ async function playerBattles(userId, limit) {
   return rows.map((r) => projectBattle(r.data));
 }
 
+/* ---------------- Trades ---------------- */
+
+// Trimmed list view: no per-item arrays, just an itemCount per side.
+function projectTrade(data) {
+  if (!data || typeof data !== "object") return data;
+  const side = (b) => (b && typeof b === "object")
+    ? { tokens: b.tokens, value: b.value, itemCount: itemCount(b.items) }
+    : { tokens: 0, value: 0, itemCount: 0 };
+  return {
+    id: data.id, tradeNumber: data.tradeNumber, status: data.status,
+    sender: data.sender, senderName: data.senderName,
+    receiver: data.receiver, receiverName: data.receiverName,
+    offer: side(data.offer), request: side(data.request),
+  };
+}
+
+// Upsert a trade by id (hashId). Called on every status change (pending ->
+// accepted/declined/cancelled/countered), mirroring saveBattle.
+async function saveTrade(record) {
+  for (const key of ["offer", "request"]) {
+    const b = record[key];
+    if (b && Array.isArray(b.items)) b.items = normalizeInventory(b.items);
+  }
+  const participants = [record.sender, record.receiver].filter((v) => v != null);
+  await pool.query(
+    `INSERT INTO trades (id, status, sender, receiver, offer_value, request_value, participants, data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (id) DO UPDATE
+       SET status=$2, sender=$3, receiver=$4, offer_value=$5, request_value=$6,
+           participants=$7, data=$8, updated_at=now()`,
+    [record.id, record.status, record.sender ?? null, record.receiver ?? null,
+     record.offer?.value ?? null, record.request?.value ?? null,
+     participants, JSON.stringify(record)]
+  );
+  return { ok: true };
+}
+
+async function getTrade(id) {
+  const { rows } = await pool.query("SELECT data, created_at, updated_at FROM trades WHERE id=$1", [id]);
+  if (!rows.length) return null;
+  return { ...rows[0].data, created_at: rows[0].created_at, updated_at: rows[0].updated_at };
+}
+
+async function recentTrades(limit) {
+  const { rows } = await pool.query("SELECT data FROM trades ORDER BY created_at DESC LIMIT $1", [clampLimit(limit)]);
+  return rows.map((r) => projectTrade(r.data));
+}
+
+async function playerTrades(userId, limit) {
+  const { rows } = await pool.query(
+    "SELECT data FROM trades WHERE $1 = ANY(participants) ORDER BY created_at DESC LIMIT $2",
+    [userId, clampLimit(limit)]
+  );
+  return rows.map((r) => projectTrade(r.data));
+}
+
 /* ---------------- Bots (the house, keyed by name) ---------------- */
 
 async function getBot(name) {
@@ -774,6 +847,7 @@ module.exports = {
   computeBoards, refreshLeaderboard, leaderboard,
   redeemCode, getActiveCodes, getCode, upsertCode, setCodeActive,
   saveBattle, getBattle, recentBattles, playerBattles,
+  saveTrade, getTrade, recentTrades, playerTrades,
   getBot, addBotTokens, grantBotItems, spendBotTokens, commitBotStake, consumeBotOutcome, setBotControl,
   normalizeInventory, mergeStacks, inventoryValue, itemCount, pool,
 };
